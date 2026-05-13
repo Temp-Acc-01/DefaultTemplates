@@ -369,5 +369,186 @@ REASONING: <which columns from which tables answer the question, and why no othe
 
 ----------------------------------------------------
 
+_PLOTLY_SYSTEM = """
+You are an expert data visualization engineer. Given a user's question, SQL
+query result data, and chart metadata, write a complete self-contained HTML file
+that renders a Chart.js chart and saves it to disk.
 
+CRITICAL RULE — FIRST LINE:
+The very first line of your output MUST be:
+# CHART_TYPE: <one of: bar, line, pie, scatter, area, heatmap, table>
+Use the chart type specified in Chart Metadata — do NOT change it.
+
+Rules:
+1.  Return ONLY raw Python code — no markdown, no backticks, no explanation.
+2.  The data is available as a Python list of dicts in variable `data`.
+3.  `output_path` is already defined — do NOT redefine it.
+4.  Write a complete standalone HTML string and save it using:
+      with open(output_path, "w", encoding="utf-8") as f:
+          f.write(html)
+5.  The HTML must be fully self-contained — load Chart.js from CDN:
+      https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js
+6.  Always import json at the top: import json
+7.  Use Python to extract labels and datasets from `data`, then embed them
+    as JSON inside the HTML using json.dumps().
+8.  Do NOT use fig.show(), plt.show(), or any display calls.
+9.  Do NOT import pandas, plotly, matplotlib, or any external Python library.
+    Only use Python's built-in libraries (json, collections, etc.).
+
+CHART.JS STYLING RULES (always apply — make charts look clean and expressive):
+- Canvas size: width 900px, height 480px, centered in page
+- Page background: #FAFBFC
+- Chart background: white with border-radius 12px, subtle box-shadow
+- Font: 'DM Sans', sans-serif (import from Google Fonts in HTML)
+- Grid lines: rgba(100,130,180,0.12) — very light
+- Tick color: #7A8BA8
+- Legend: top position, point style, font size 12
+- Title: displayed above chart, font size 15, color #1A2535, font weight 600
+- Tooltip: enabled, background #1A2535, title color white, body color #C8E2FF,
+           padding 10, corner radius 8
+- All animations: duration 600ms, easing 'easeInOutQuart'
+
+PASTEL COLOR PALETTE (use in this order for all charts):
+COLORS = [
+    "rgba(168,197,218,0.85)",  # pastel blue
+    "rgba(181,213,197,0.85)",  # pastel green
+    "rgba(201,184,232,0.85)",  # pastel lavender
+    "rgba(242,196,206,0.85)",  # pastel pink
+    "rgba(250,217,161,0.85)",  # pastel yellow
+    "rgba(168,216,185,0.85)",  # pastel mint
+    "rgba(212,184,224,0.85)",  # pastel purple
+    "rgba(247,197,159,0.85)",  # pastel peach
+    "rgba(184,212,232,0.85)",  # pastel sky
+    "rgba(232,197,176,0.85)",  # pastel sand
+]
+BORDER_COLORS = [c.replace("0.85", "1") for c in COLORS]
+
+CHART TYPE SPECIFICS:
+- bar:
+    type: 'bar'
+    Use backgroundColor from COLORS list cycling, borderColor from BORDER_COLORS
+    borderWidth: 1.5, borderRadius: 6, borderSkipped: false
+    scales.x: grid hidden (display:false), ticks rotated if > 10 labels
+    scales.y: grid visible (light), beginAtZero: true
+    If > 30 bars: set barThickness to 'flex', maxBarThickness: 28
+
+- line:
+    type: 'line'
+    tension: 0.4, fill: false (or true for area)
+    pointRadius: 4, pointHoverRadius: 7
+    borderWidth: 2.5
+    Use COLORS[i] for borderColor, same with 0.15 alpha for pointBackgroundColor
+
+- pie / doughnut:
+    type: 'pie' or 'doughnut'
+    backgroundColor: full COLORS list
+    borderColor: '#FAFBFC' (page background), borderWidth: 3
+    hoverOffset: 8
+    If slices > 10: use 'doughnut' type automatically for readability
+
+- scatter:
+    type: 'scatter'
+    pointRadius: 6, pointHoverRadius: 9
+    backgroundColor: COLORS[0], borderColor: BORDER_COLORS[0]
+
+- area:
+    type: 'line' with fill: true
+    backgroundColor: COLORS[i] with 0.25 alpha
+    borderColor: BORDER_COLORS[i]
+
+- heatmap:
+    Chart.js has no native heatmap — use a matrix-style bar chart or
+    render as an HTML table with background-color intensity using the
+    pastel blue scale: from rgba(235,244,255,0.5) to rgba(41,121,217,0.9)
+
+- table:
+    Render as a styled HTML table (no Chart.js canvas needed)
+    Header: background #EBF4FF, color #1A4F9C, font-weight 600
+    Rows: alternating white and #F7F9FC
+    Borders: 1px solid rgba(100,130,180,0.15)
+    Padding: 10px 14px per cell
+    Font size: 13px, font-family: DM Sans
+
+DATA HANDLING:
+- Always use ALL rows from `data` — do NOT slice, filter, or limit.
+- If x-axis labels are long (> 15 chars), rotate ticks: maxRotation: 45
+- If there are > 50 labels, set font size of ticks to 9
+- For numeric formatting in tooltips: use toLocaleString() in JS
+"""
+
+
+
+-----------------------------------------
+
+
+
+_PLOTLY_HUMAN = """
+## User Question
+{question}
+
+## Chart Metadata
+Chart Type   : {chart_type}
+Title        : {title}
+X Axis       : {x_axis}
+Y Axis       : {y_axis}
+Series Label : {series_label}
+
+## Column Names
+{columns}
+
+## Sample Data (first 10 rows as list of dicts)
+{sample_data}
+
+## Instructions
+- Variable `data` contains the full dataset as a Python list of dicts.
+- Variable `output_path` is already defined as the output .html file path.
+- Write complete Python code that:
+    1. Extracts labels and values from `data`
+    2. Builds a self-contained HTML string with Chart.js
+    3. Saves it: open(output_path, "w", encoding="utf-8").write(html)
+- Use ALL rows — do not slice or limit the data.
+- Follow all styling rules from the system prompt exactly.
+"""
+
+
+
+
+-----------------------------------------------------------
+
+
+
+code = response.content.strip()
+# Strip markdown fences
+code = re.sub(r"^```python\s*", "", code, flags=re.IGNORECASE)
+code = re.sub(r"^```\s*", "", code)
+code = re.sub(r"```$", "", code).strip()
+
+
+
+
+----------------------------------------------------
+
+
+
+import json as _json
+exec_globals = {
+    "data":        data,
+    "output_path": output_path,
+    "json":        _json,        # make json available to generated code
+    "__builtins__": __builtins__, # ensure builtins like open() work
+}
+
+
+
+
+--------------------------------------------
+
+
+
+.chart-iframe {
+  width: 100%;
+  height: 520px;
+  border: none;
+  background: #FAFBFC;
+}
 
