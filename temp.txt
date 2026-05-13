@@ -1,607 +1,95 @@
-_PLOTLY_SYSTEM = """
-You are an expert Python data visualization engineer using Plotly.
-Given a user's question, SQL query result data, and chart metadata,
-write complete executable Python code that generates the chart and saves it as an HTML file.
+AXIS LABEL RULES (MANDATORY — never skip these):
+- For bar, line, area, scatter charts: ALWAYS set both x and y axis titles.
+- Use the EXACT column name from X Axis and Y Axis metadata as the label text.
+- Never leave axis titles empty, undefined, or omit the title config block.
+- Required config for every x and y axis:
+    scales: {
+      x: {
+        title: { display: true, text: '<X Axis column name>', font: { size: 12, family: "'DM Sans', sans-serif" }, color: '#7A8BA8', padding: { top: 8 } },
+        ...
+      },
+      y: {
+        title: { display: true, text: '<Y Axis column name>', font: { size: 12, family: "'DM Sans', sans-serif" }, color: '#7A8BA8', padding: { bottom: 8 } },
+        ...
+      }
+    }
+- For pie/doughnut: no axis titles needed — skip this rule.
+- For table/heatmap: no axis titles needed — skip this rule.
 
-CRITICAL RULE: You MUST use EXACTLY the chart type specified in Chart Metadata.
-Do NOT substitute a different chart type under any circumstances, even if you
-think another type would look better. The chart type has already been decided.
-
-Rules:
-1. Return ONLY raw Python code — no markdown, no backticks, no explanation.
-
-
-
-
------------------------------------
-
-7. Plot ALL rows from the data — do NOT slice, filter, or limit the dataset in any way.
-   Use the complete `data` variable as-is. Do not add .head(), .tail(), [:N], or TOP N anywhere.
-
-
--------------------------------------------------------
-
-
-1. Return ONLY raw Python code — no markdown, no backticks, no explanation.
-   The very first line of your code MUST be a comment declaring the chart type you used:
-   # CHART_TYPE: bar
-   Use exactly one of: bar, line, pie, scatter, area, heatmap, table
-
-
-
-
-
------------------------------
-
-@dataclass
-class PlotlyResult:
-    success:           bool
-    code:              str           = ""
-    output_html:       Optional[str] = None
-    error:             Optional[str] = None
-    actual_chart_type: Optional[str] = None   # what Agent 4 actually plotted
-
-
------------------------------------------
-
-
-# Parse actual chart type from first-line comment
-actual_chart_type = viz_meta.chart_type  # fallback to what was requested
-first_line = code.strip().splitlines()[0] if code.strip() else ""
-chart_type_match = re.search(r"#\s*CHART_TYPE:\s*(\w+)", first_line, re.IGNORECASE)
-if chart_type_match:
-    actual_chart_type = chart_type_match.group(1).lower()
-    if actual_chart_type != viz_meta.chart_type:
-        logger.info(
-            "PlotlyCodeAgent overrode chart type: '%s' → '%s'",
-            viz_meta.chart_type, actual_chart_type,
-        )
-
-try:
-    exec(code, exec_globals)   # nosec — LLM-generated plotly code only
-    return PlotlyResult(
-        success           = True,
-        code              = code,
-        output_html       = output_path,
-        actual_chart_type = actual_chart_type,
-    )
-except Exception as exc:
-    return PlotlyResult(
-        success           = False,
-        code              = code,
-        error             = f"Code execution failed: {exc}",
-        actual_chart_type = actual_chart_type,
-    )
-
-
-
-------------------------------
-
-
-# ── Agent 4: Plotly chart ──────────────────────────────────────────────────
-plotly_result = self._plotly.generate(
-    question=question,
-    viz_meta=viz,
-    columns=cols,
-    data=data,
-)
-
-# Reconcile: if Agent 4 used a different chart type, update viz so
-# the metadata SSE and final response reflect what was actually plotted
-chart_type_changed = (
-    plotly_result.actual_chart_type and
-    plotly_result.actual_chart_type != viz.chart_type
-)
-if chart_type_changed:
-    logger.info(
-        "Reconciling viz_meta chart_type: '%s' → '%s'",
-        viz.chart_type, plotly_result.actual_chart_type,
-    )
-    viz.chart_type = plotly_result.actual_chart_type
-
-yield sse("chart_ready", {
-    "output_html":      plotly_result.output_html,
-    "plotly_code":      plotly_result.code,
-    "error":            plotly_result.error,
-    "actual_chart_type": viz.chart_type,   # always the final reconciled type
-    "chart_type_changed": chart_type_changed,
-})
-
-
------------------------------------
-
-
-# ── Agent 4 — Plotly chart ──
-plotly_result = self._plotly.generate(
-    question = question,
-    viz_meta = viz,
-    columns  = cols,
-    data     = data,
-)
-
-# Reconcile chart type
-if plotly_result.actual_chart_type and plotly_result.actual_chart_type != viz.chart_type:
-    viz.chart_type = plotly_result.actual_chart_type
-
-# Build column_roles map from viz metadata
 
 
 ---------------------------
 
 
+# REPLACE these two lines in _VIZ_SYSTEM:
+X_AXIS: <exact column name or alias from Result Columns to use as primary/category axis, or NONE>
+Y_AXIS: <exact column name or alias from Result Columns to use as primary value axis, or NONE>
 
-case 'chart_ready': {
-  // Reconcile metadata card if Agent 4 used a different chart type
-  if (payload.chart_type_changed && payload.actual_chart_type && metaBlock) {
-    const chartPill = metaBlock.querySelector('.meta-pill.chart');
-    if (chartPill) {
-      chartPill.textContent = payload.actual_chart_type;
-    }
-    // Update local vizData so snapshot is also correct
-    if (vizData) vizData.chart_type = payload.actual_chart_type;
-  }
-
-  if (payload.output_html) {
-    const chartFile = payload.output_html.split('/').pop();
-    chartBlock = buildChartFrame(chartFile, vizData?.title || 'Chart');
+# WITH:
+X_AXIS: <exact column name or alias from Result Columns to use as primary/category axis.
+         MANDATORY for bar, line, area, scatter — must NEVER be NONE for these chart types.
+         Use NONE only for pie, heatmap, table.>
+Y_AXIS: <exact column name or alias from Result Columns to use as primary value axis.
+         MANDATORY for bar, line, area, scatter — must NEVER be NONE for these chart types.
+         Pick the numeric column. Use NONE only for pie, heatmap, table.>
 
 
-
------------------------------------
-
-
-_GENERATOR_SYSTEM = """
-You are an expert SQL engineer. Convert the user's natural language question into
-a valid MS SQL Server (T-SQL) query using the provided table schemas.
-
-Rules:
-1.  Return ONLY the raw SQL — no markdown, no backticks, no explanation, no comments.
-2.  Use the EXACT table and column names from the schema — case-sensitive, no guessing.
-3.  Always use [dbo].[TableName] format for ALL table references.
-4.  Always qualify columns as alias.[ColumnName] when multiple tables are involved.
-5.  Use square brackets for ALL identifiers: [ColumnName], [TableName]. NEVER double quotes.
-6.  Use JOINs only when the question genuinely requires data from multiple tables.
-7.  If aggregation is needed, include GROUP BY with ALL non-aggregate SELECT columns.
-8.  Do NOT compare VARCHAR columns with numeric literals — cast if needed.
-9.  Do NOT end with a semicolon.
-10. Use TOP N instead of LIMIT N.
-11. Use GETDATE() instead of NOW() or CURRENT_DATE.
-12. ALWAYS alias every aggregation or CAST with a clean readable name:
-      COUNT(*)              AS total_count
-      SUM(t.[Revenue])      AS total_revenue
-      AVG(CAST(t.[Price] AS FLOAT)) AS avg_price
-13. NEVER leave any aggregation or CAST expression without an AS alias.
-14. If the question is ambiguous, make the most reasonable single interpretation
-    and generate one query — do not ask clarifying questions.
-15. Output exactly one SQL SELECT statement — nothing else.
-"""
-
-
---------------------------------
-
-
-def _execute(self, sql: str, tables_used: list = None):
-    try:
-        if tables_used and self._loader.uses_mssql_tables(tables_used):
-            df = self._loader.execute_on_mssql(sql)
-        else:
-            df = self._loader.execute(sql)
-        if df is None or (hasattr(df, 'empty') and df.empty and len(df.columns) == 0):
-            return False, None, "Query returned no columns — likely a schema mismatch."
-        return True, df, None
-    except Exception as exc:
-        return False, None, str(exc)
-
-
-
-
------------------------------------
-
-
-
-def validate(self, sql: str, schema: str, question: str,
-             tables_used: list = None, skip_semantic: bool = False):
-    """Returns (is_valid, result_df_or_None, error_or_None, lint_warnings)."""
-    lint_warns              = self._lint(sql)
-    ok, result_df, exec_err = self._execute(sql, tables_used=tables_used)
-
-    if not ok:
-        return False, None, exec_err, lint_warns
-
-    # Skip semantic check when caller requests it (e.g. retry attempts)
-    if not skip_semantic:
-        sem_ok, sem_reason = self._semantic(schema, question, sql)
-        if not sem_ok:
-            return False, None, f"Semantic mismatch: {sem_reason}", lint_warns
-
-    return True, result_df, None, lint_warns
-
-
------------------------------------
-
-
-
-for attempt in range(1, max_retries + 2):
-    # ... generate sql ...
-
-    is_valid, result_df, val_error, lint_warns = self._validator.validate(
-        sql          = sql,
-        schema       = schema,
-        question     = question,
-        tables_used  = relevant,
-        skip_semantic = attempt > 1,   # ← only semantic-check first attempt
-    )
 
 
 -----------------------
 
 
-_GENERATOR_SYSTEM = """
-You are an expert MS SQL Server (T-SQL) engineer. Your job is to convert a
-natural language question into a single deterministic SQL query.
+# In VizMetaAgent.generate(), after the _parse calls — add this block:
 
-Before writing SQL, silently resolve these in order:
-  S1. What is the user's core intent? (count, list, sum, average, rank, filter)
-  S2. Which exact columns from the schema satisfy that intent?
-  S3. Is aggregation needed? If yes: which function, which column, what alias?
-  S4. Which columns go in GROUP BY? (all non-aggregated SELECT columns)
-  S5. Is there a TOP N or ORDER BY implied? Extract N exactly.
-  S6. Are JOINs needed? If yes: which tables, which keys?
+chosen_type = (_parse("CHART_TYPE") or "table").lower()
+x_axis      = _parse("X_AXIS")
+y_axis      = _parse("Y_AXIS")
 
-Then write exactly one SQL query following ALL rules below.
-Output ONLY the raw SQL — no markdown, no backticks, no comments, no explanation.
+# Enforce: bar, line, area, scatter MUST have x and y axis
+REQUIRES_AXES = {"bar", "line", "area", "scatter"}
+if chosen_type in REQUIRES_AXES:
+    cols = columns  # columns list passed into generate()
+    numeric_cols = [c for c in cols if any(
+        kw in c.lower() for kw in ["count","total","sum","avg","amount","value","num","score","rate","pct"]
+    )]
+    category_cols = [c for c in cols if c not in numeric_cols]
 
-IDENTIFIER RULES (never break these):
-- ALL table references: [dbo].[TableName]
-- ALL column references: alias.[ColumnName] or [ColumnName]
-- NEVER use double quotes around identifiers — always square brackets
-- Column names must be copied VERBATIM from the schema — no paraphrasing
+    if not x_axis and category_cols:
+        x_axis = category_cols[0]
+        logger.warning("VizMetaAgent: x_axis was None for %s — defaulting to '%s'", chosen_type, x_axis)
+    elif not x_axis and cols:
+        x_axis = cols[0]
 
-QUERY RULES:
-- Use TOP N not LIMIT N
-- Use GETDATE() not NOW() or CURRENT_DATE
-- Every aggregation MUST have an AS alias: COUNT(*) AS total_count
-- Every CAST MUST have an AS alias: CAST(x AS FLOAT) AS x_float
-- GROUP BY must include ALL non-aggregated columns in SELECT
-- Do NOT end with a semicolon
-- Output exactly ONE SELECT statement — nothing else
-- If the question implies ranking, always add ORDER BY on the aggregated column
-- If the question says "top N", always use TOP N in the SELECT clause
-- If the question says "by [dimension]", always GROUP BY that dimension
+    if not y_axis and numeric_cols:
+        y_axis = numeric_cols[0]
+        logger.warning("VizMetaAgent: y_axis was None for %s — defaulting to '%s'", chosen_type, y_axis)
+    elif not y_axis and len(cols) > 1:
+        y_axis = cols[1]
 
-CONSISTENCY RULES (critical — same question must always give same SQL):
-- For counting users/records with no specific column: always use COUNT(*) AS total_count
-- For grouping by geography (district/state/city/zone): use the most specific
-  geographic column available in the schema
-- When multiple columns could work, pick the one whose name most closely matches
-  the user's wording — commit to it, do not alternate
-- Never use COUNT(DISTINCT x) unless the user explicitly says "unique" or "distinct"
-- Never use a subquery when a simple GROUP BY achieves the same result
-"""
+return VizMeta(
+    chart_type     = chosen_type,
+    title          = _parse("TITLE") or question[:60],
+    x_axis         = x_axis,
+    y_axis         = y_axis,
+    secondary_axis = _parse("SECONDARY_AXIS"),
+    series_label   = _parse("SERIES_LABEL"),
+    reasoning      = _parse("REASONING") or "",
+)
 
 
 
-----------------------------------------------
 
 
-_GENERATOR_HUMAN = """
-## Table Schemas
-{schema}
+--------------------------
 
-## User Question
-{question}
 
-## Resolution (complete this mentally before writing SQL)
-Step 1 — Intent    : What does the user want? (be specific: "count of X grouped by Y, top N")
-Step 2 — Tables    : Which table(s) contain the needed data?
-Step 3 — Columns   : Copy the exact column names from the schema for SELECT and GROUP BY
-Step 4 — Aggregation: COUNT(*)/SUM/AVG/MAX/MIN or none? What alias?
-Step 5 — Ordering  : ORDER BY which column, ASC or DESC?
-Step 6 — Limit     : TOP N needed? What is N?
 
-Do NOT output the resolution. Output ONLY the final SQL query.
+def generate(self, question: str, sql: str, columns: list, sample_data: list) -> VizMeta:
+    # columns is now used in the fallback enforcement block above
 
-{error_context}
 
-SQL:
-"""
 
 
+----------------------
 
 
---------------------------------------------------
-
-
-_ERROR_CONTEXT_TMPL = """
-## Previous Attempt — FAILED
-SQL:
-{prev_sql}
-
-Error:
-{error}
-
-Lint:
-{lint_warnings}
-
-Fix instructions:
-1. Read the error message carefully — it usually names the exact column or syntax problem.
-2. Copy column names VERBATIM from the schema — do not rephrase or abbreviate.
-3. Use [dbo].[TableName] for all tables, alias.[ColumnName] for all columns.
-4. Use square brackets — NEVER double quotes around identifiers.
-5. If the error says "invalid column name X", find column X in the schema and use
-   the exact casing shown there.
-6. Do not change the query structure — only fix the specific error.
-7. Output ONLY the corrected SQL.
-"""
-
-
-
-
------------------------------------------------------------
-
-
-
-
-_TABLE_SELECTOR_SYSTEM = """
-You are a data analyst assistant. Select the minimum set of tables needed to
-answer the user's question — no more, no fewer.
-
-Each table entry shows:
-  INTERNAL_NAME | display: [dbo].[ActualName] | (N rows) | columns: col1, col2, ...
-
-Selection rules (apply in order, stop at first match):
-1. If one table contains ALL needed columns → use only that table.
-2. If a JOIN is needed → use exactly the tables required for that JOIN, no extras.
-3. If multiple tables could work → prefer the one whose name or columns most
-   closely match the user's wording. Commit to that choice — do not alternate.
-4. Never include a table "just in case" — only include if directly needed.
-5. Use ONLY the INTERNAL_NAME (before the | symbol) in your response.
-
-Return ONLY this format — nothing else:
-
-TABLES: internal_name1,internal_name2
-REASONING: <which columns from which tables answer the question, and why no other tables are needed>
-"""
-
-
-
-
-
-----------------------------------------------------
-
-_PLOTLY_SYSTEM = """
-You are an expert data visualization engineer. Given a user's question, SQL
-query result data, and chart metadata, write a complete self-contained HTML file
-that renders a Chart.js chart and saves it to disk.
-
-CRITICAL RULE — FIRST LINE:
-The very first line of your output MUST be:
-# CHART_TYPE: <one of: bar, line, pie, scatter, area, heatmap, table>
-Use the chart type specified in Chart Metadata — do NOT change it.
-
-Rules:
-1.  Return ONLY raw Python code — no markdown, no backticks, no explanation.
-2.  The data is available as a Python list of dicts in variable `data`.
-3.  `output_path` is already defined — do NOT redefine it.
-4.  Write a complete standalone HTML string and save it using:
-      with open(output_path, "w", encoding="utf-8") as f:
-          f.write(html)
-5.  The HTML must be fully self-contained — load Chart.js from CDN:
-      https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js
-6.  Always import json at the top: import json
-7.  Use Python to extract labels and datasets from `data`, then embed them
-    as JSON inside the HTML using json.dumps().
-8.  Do NOT use fig.show(), plt.show(), or any display calls.
-9.  Do NOT import pandas, plotly, matplotlib, or any external Python library.
-    Only use Python's built-in libraries (json, collections, etc.).
-
-CHART.JS STYLING RULES (always apply — make charts look clean and expressive):
-- Canvas size: width 900px, height 480px, centered in page
-- Page background: #FAFBFC
-- Chart background: white with border-radius 12px, subtle box-shadow
-- Font: 'DM Sans', sans-serif (import from Google Fonts in HTML)
-- Grid lines: rgba(100,130,180,0.12) — very light
-- Tick color: #7A8BA8
-- Legend: top position, point style, font size 12
-- Title: displayed above chart, font size 15, color #1A2535, font weight 600
-- Tooltip: enabled, background #1A2535, title color white, body color #C8E2FF,
-           padding 10, corner radius 8
-- All animations: duration 600ms, easing 'easeInOutQuart'
-
-PASTEL COLOR PALETTE (use in this order for all charts):
-COLORS = [
-    "rgba(168,197,218,0.85)",  # pastel blue
-    "rgba(181,213,197,0.85)",  # pastel green
-    "rgba(201,184,232,0.85)",  # pastel lavender
-    "rgba(242,196,206,0.85)",  # pastel pink
-    "rgba(250,217,161,0.85)",  # pastel yellow
-    "rgba(168,216,185,0.85)",  # pastel mint
-    "rgba(212,184,224,0.85)",  # pastel purple
-    "rgba(247,197,159,0.85)",  # pastel peach
-    "rgba(184,212,232,0.85)",  # pastel sky
-    "rgba(232,197,176,0.85)",  # pastel sand
-]
-BORDER_COLORS = [c.replace("0.85", "1") for c in COLORS]
-
-CHART TYPE SPECIFICS:
-- bar:
-    type: 'bar'
-    Use backgroundColor from COLORS list cycling, borderColor from BORDER_COLORS
-    borderWidth: 1.5, borderRadius: 6, borderSkipped: false
-    scales.x: grid hidden (display:false), ticks rotated if > 10 labels
-    scales.y: grid visible (light), beginAtZero: true
-    If > 30 bars: set barThickness to 'flex', maxBarThickness: 28
-
-- line:
-    type: 'line'
-    tension: 0.4, fill: false (or true for area)
-    pointRadius: 4, pointHoverRadius: 7
-    borderWidth: 2.5
-    Use COLORS[i] for borderColor, same with 0.15 alpha for pointBackgroundColor
-
-- pie / doughnut:
-    type: 'pie' or 'doughnut'
-    backgroundColor: full COLORS list
-    borderColor: '#FAFBFC' (page background), borderWidth: 3
-    hoverOffset: 8
-    If slices > 10: use 'doughnut' type automatically for readability
-
-- scatter:
-    type: 'scatter'
-    pointRadius: 6, pointHoverRadius: 9
-    backgroundColor: COLORS[0], borderColor: BORDER_COLORS[0]
-
-- area:
-    type: 'line' with fill: true
-    backgroundColor: COLORS[i] with 0.25 alpha
-    borderColor: BORDER_COLORS[i]
-
-- heatmap:
-    Chart.js has no native heatmap — use a matrix-style bar chart or
-    render as an HTML table with background-color intensity using the
-    pastel blue scale: from rgba(235,244,255,0.5) to rgba(41,121,217,0.9)
-
-- table:
-    Render as a styled HTML table (no Chart.js canvas needed)
-    Header: background #EBF4FF, color #1A4F9C, font-weight 600
-    Rows: alternating white and #F7F9FC
-    Borders: 1px solid rgba(100,130,180,0.15)
-    Padding: 10px 14px per cell
-    Font size: 13px, font-family: DM Sans
-
-DATA HANDLING:
-- Always use ALL rows from `data` — do NOT slice, filter, or limit.
-- If x-axis labels are long (> 15 chars), rotate ticks: maxRotation: 45
-- If there are > 50 labels, set font size of ticks to 9
-- For numeric formatting in tooltips: use toLocaleString() in JS
-"""
-
-
-
------------------------------------------
-
-
-
-_PLOTLY_HUMAN = """
-## User Question
-{question}
-
-## Chart Metadata
-Chart Type   : {chart_type}
-Title        : {title}
-X Axis       : {x_axis}
-Y Axis       : {y_axis}
-Series Label : {series_label}
-
-## Column Names
-{columns}
-
-## Sample Data (first 10 rows as list of dicts)
-{sample_data}
-
-## Instructions
-- Variable `data` contains the full dataset as a Python list of dicts.
-- Variable `output_path` is already defined as the output .html file path.
-- Write complete Python code that:
-    1. Extracts labels and values from `data`
-    2. Builds a self-contained HTML string with Chart.js
-    3. Saves it: open(output_path, "w", encoding="utf-8").write(html)
-- Use ALL rows — do not slice or limit the data.
-- Follow all styling rules from the system prompt exactly.
-"""
-
-
-
-
------------------------------------------------------------
-
-
-
-code = response.content.strip()
-# Strip markdown fences
-code = re.sub(r"^```python\s*", "", code, flags=re.IGNORECASE)
-code = re.sub(r"^```\s*", "", code)
-code = re.sub(r"```$", "", code).strip()
-
-
-
-
-----------------------------------------------------
-
-
-
-import json as _json
-exec_globals = {
-    "data":        data,
-    "output_path": output_path,
-    "json":        _json,        # make json available to generated code
-    "__builtins__": __builtins__, # ensure builtins like open() work
-}
-
-
-
-
---------------------------------------------
-
-
-
-.chart-iframe {
-  width: 100%;
-  height: 520px;
-  border: none;
-  background: #FAFBFC;
-}
-
-
-----------------------------------------------------------
-
-.chart-frame-wrap {
-  background: transparent;
-  border: none;
-  border-radius: 0;
-  overflow: hidden;
-  animation: fadeUp 0.25s ease;
-}
-
-.chart-frame-header {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  padding: 0 0 6px 0;
-  border-bottom: none;
-  background: transparent;
-}
-
-.chart-frame-title {
-  display: none;
-}
-
-.chart-open-btn {
-  font-size: 11px;
-  color: var(--text-muted);
-  text-decoration: none;
-  padding: 2px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: transparent;
-  font-weight: 400;
-  transition: color 0.12s, border-color 0.12s;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-family: 'DM Sans', sans-serif;
-  cursor: pointer;
-}
-
-.chart-open-btn:hover {
-  color: var(--blue-600);
-  border-color: var(--blue-200);
-  background: transparent;
-}
-
-.chart-iframe {
-  width: 100%;
-  height: 520px;
-  border: none;
-  background: transparent;
-}
