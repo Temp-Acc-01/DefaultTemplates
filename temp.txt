@@ -1,203 +1,100 @@
-LABEL_INTELLIGENCE_RULES = """
-## Intelligent Label & Legend Rules (apply based on data size — never hardcode)
-
-Inspect the data BEFORE writing any chart code, then apply these rules:
-
-### Legend
-- If number of unique series/categories > 15  → HIDE the legend entirely (legend: {display: false})
-- If 8 < unique series <= 15                  → show legend but position it BOTTOM, font size 10
-- If unique series <= 8                       → show legend normally
-
-### X-axis tick labels
-- If number of x-axis labels > 20             → rotate 45°, font size 10, max tick rotation
-- If number of x-axis labels > 40             → HIDE x-axis tick labels entirely (display: false)
-- If number of x-axis labels <= 20            → show normally, rotate 0°
-
-### Y-axis label
-- Always display Y-axis title HORIZONTALLY by setting rotation: 0 in ticks config
-- Never let the axis title overlap the chart area
-
-### Bar chart with grouped/stacked series > 15 categories
-- Automatically switch display to STACKED bar (stacked: true) 
-- This collapses the visual noise of 100+ grouped bars
-
-### General
-- Always set layout padding: { top: 20, right: 20, bottom: 60, left: 60 }
-- Always call chart.resize() after render to fit the container
-- Never show a tooltip that displays all 300+ series at once — limit tooltip to top 5 values
+"""
+## Chart Layout Rules (mandatory, apply to every chart)
+- Set Chart.js layout: { padding: { top: 10, right: 16, bottom: 10, left: 0 } }
+- Set legend: { display: false } when series count > 10
+- Set maintainAspectRatio: false and let the container control height
+- The chart HTML body must have: margin:0; padding:0; overflow:hidden; background:transparent
+- The <canvas> must be: width:100%; height:100%; display:block
+- The container div wrapping canvas must be: width:100%; height:100vh; padding:0; margin:0
+- Y-axis title: set display:false — the axis values are self-explanatory
+- Minimize all default Chart.js whitespace reserves
 """
 
 
-
-Before writing code, state:
-- How many rows in the data?
-- How many unique X-axis values?  
-- How many unique series/legend items?
-Then apply the label intelligence rules above.
+----------
 
 
+case 'chart_ready': {
+  if (payload.chart_type_changed && payload.actual_chart_type && metaBlock) {
+    const chartPill = metaBlock.querySelector('.meta-pill.chart');
+    if (chartPill) chartPill.textContent = payload.actual_chart_type;
+    if (vizData) vizData.chart_type = payload.actual_chart_type;
+  }
 
-------------------------
+  if (payload.output_html) {
+    const chartFile = payload.output_html.split('/').pop();
+    chartBlock = buildChartFrame(chartFile, vizData?.title || 'Chart');
 
-
-/* ── Chart Modal ── */
-.chart-modal-overlay {
-  display: none;
-  position: fixed; inset: 0;
-  background: rgba(15, 25, 50, 0.45);
-  backdrop-filter: blur(3px);
-  z-index: 1000;
-  align-items: center;
-  justify-content: center;
-  padding: 32px;
-  animation: fadeUp 0.2s ease;
-}
-.chart-modal-overlay.open { display: flex; }
-
-.chart-modal {
-  background: var(--surface);
-  border: 1px solid var(--border-md);
-  border-radius: var(--radius-xl);
-  box-shadow: 0 24px 64px rgba(15,25,50,0.18);
-  width: 100%;
-  max-width: 1100px;
-  height: 82vh;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  animation: fadeUp 0.22s ease;
-}
-
-.chart-modal-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 18px 12px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-.chart-modal-title {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-secondary);
-  letter-spacing: -0.1px;
-}
-
-.chart-modal-close {
-  width: 28px; height: 28px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text-muted);
-  display: flex; align-items: center; justify-content: center;
-  cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
-  font-family: 'DM Sans', sans-serif;
-}
-.chart-modal-close:hover {
-  background: var(--slate-100);
-  color: var(--text-primary);
-  border-color: var(--border-md);
-}
-.chart-modal-close svg { width: 14px; height: 14px; }
-
-.chart-modal-body {
-  flex: 1;
-  overflow: hidden;
-  padding: 0;
-}
-.chart-modal-body iframe {
-  width: 100%;
-  height: 100%;
-  border: none;
-  display: block;
+    // ← Insert DIRECTLY into bw, before timestamp, NOT inside any bubble
+    if (tsSpan && tsSpan.parentNode === bw) {
+      bw.insertBefore(chartBlock, tsSpan);
+    } else {
+      bw.appendChild(chartBlock);
+    }
+    snapshot.chart = chartBlock;
+  } else if (payload.error) {
+    const errEl = buildErrorEl(`Chart generation failed: ${payload.error}`);
+    bw.appendChild(errEl);
+  }
+  addOrReplaceTimestamp();
+  scrollToBottom();
+  break;
 }
 
 
+---------------
 
 
 
+function buildChartFrame(chartFile, title) {
+  const wrap = document.createElement('div');
+  wrap.className = 'chart-frame-wrap';
+  wrap.style.cssText = 'width:100%; background:transparent; border:none; border-radius:0; padding:0; margin-top:6px;';
 
+  const header = document.createElement('div');
+  header.className = 'chart-frame-header';
+  header.innerHTML = `
+    <button class="chart-open-btn"
+      onclick="openChartModal('${API_BASE}/chart/${encodeURIComponent(chartFile)}', '${(title||'Chart').replace(/'/g,"\\'")}')">
+      <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
+        <path d="M19 19H5V5h7V3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/>
+      </svg>
+      Expand chart
+    </button>`;
 
+  const iframe = document.createElement('iframe');
+  iframe.className = 'chart-iframe';
+  iframe.src = `${API_BASE}/chart/${encodeURIComponent(chartFile)}`;
+  iframe.loading = 'lazy';
+  iframe.style.cssText = 'width:100%; height:420px; border:none; border-radius:var(--radius-md); display:block; background:transparent;';
 
+  iframe.onload = () => {
+    try {
+      const idoc = iframe.contentDocument || iframe.contentWindow.document;
+      const style = idoc.createElement('style');
+      style.textContent = `
+        html, body {
+          margin: 0 !important; padding: 0 !important;
+          overflow: hidden !important; background: transparent !important;
+          width: 100% !important; height: 100% !important;
+        }
+        canvas { display: block !important; }
+        /* Tighten Chart.js default padding */
+        .chart-container, [class*="chart"] {
+          padding: 0 !important;
+        }
+      `;
+      idoc.head.appendChild(style);
 
+      // Auto-height: use scrollHeight but cap between 320-600px
+      const h = idoc.body.scrollHeight;
+      if (h && h > 100) {
+        iframe.style.height = Math.min(Math.max(h, 320), 600) + 'px';
+      }
+    } catch { /* cross-origin */ }
+  };
 
-----------------------
-
-
-<!-- Chart Modal -->
-<div class="chart-modal-overlay" id="chart-modal-overlay" onclick="closeChartModal(event)">
-  <div class="chart-modal">
-    <div class="chart-modal-header">
-      <span class="chart-modal-title" id="chart-modal-title">Chart</span>
-      <button class="chart-modal-close" onclick="closeChartModal(null)" title="Close">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <path d="M18 6L6 18M6 6l12 12"/>
-        </svg>
-      </button>
-    </div>
-    <div class="chart-modal-body">
-      <iframe id="chart-modal-iframe" src="" title="Chart fullscreen"></iframe>
-    </div>
-  </div>
-</div>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-----------------------------------------
-
-
-
-
-function openChartModal(chartUrl, title) {
-  const overlay = document.getElementById('chart-modal-overlay');
-  document.getElementById('chart-modal-iframe').src = chartUrl;
-  document.getElementById('chart-modal-title').textContent = title || 'Chart';
-  overlay.classList.add('open');
-  document.body.style.overflow = 'hidden';
+  wrap.appendChild(header);
+  wrap.appendChild(iframe);
+  return wrap;
 }
-
-function closeChartModal(event) {
-  // Close only if clicking the overlay backdrop (not the modal itself)
-  if (event && event.target !== document.getElementById('chart-modal-overlay')) return;
-  const overlay = document.getElementById('chart-modal-overlay');
-  overlay.classList.remove('open');
-  document.getElementById('chart-modal-iframe').src = '';
-  document.body.style.overflow = '';
-}
-
-// Close on Escape key
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeChartModal(null);
-});
-
-
-
-
-
-
-
-
-
-
-
-
------------------------------
-
-
-onclick="openChartModal('${API_BASE}/chart/${encodeURIComponent(chartFile)}', '${(title||'Chart').replace(/'/g,"\\'")}')">
-
