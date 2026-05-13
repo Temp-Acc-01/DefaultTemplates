@@ -1,72 +1,16 @@
-copyBtn.onclick = () => {
-  // navigator.clipboard only works on HTTPS/localhost
-  // Use execCommand fallback for plain HTTP remote servers
-  const success = (() => {
-    try {
-      // Modern API — works on HTTPS / localhost
-      if (navigator.clipboard && window.isSecureContext) {
-        navigator.clipboard.writeText(content);
-        return true;
-      }
-      // Fallback for HTTP — create temp textarea, copy, remove
-      const ta = document.createElement('textarea');
-      ta.value = content;
-      ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0';
-      document.body.appendChild(ta);
-      ta.focus();
-      ta.select();
-      const ok = document.execCommand('copy');
-      document.body.removeChild(ta);
-      return ok;
-    } catch {
-      return false;
-    }
-  })();
-
-  if (success !== false) {
-    copyBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" style="color:var(--teal-400)">
-      <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/>
-    </svg>`;
-    setTimeout(() => {
-      copyBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor">
-        <path d="M16 1H4C2.9 1 2 1.9 2 3v14h2V3h12V1zm3 4H8C6.9 5 6 5.9 6 7v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
-      </svg>`;
-    }, 1500);
-  }
-};
-
-
-
-------------------
-
-
-
-function copySQL(elId) {
-  const el = document.getElementById(elId);
-  if (!el) return;
-
-  const text = el.textContent;
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      navigator.clipboard.writeText(text);
-    } else {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0';
-      document.body.appendChild(ta);
-      ta.focus();
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-    }
-  } catch {}
-
-  // Fix the button feedback — was also broken (wrong DOM traversal)
-  // The copy button is INSIDE sql-header, the code el is INSIDE sql-block
-  // So walk up to sql-block, then find the button inside sql-header
-  const btn = el.closest('.sql-block')?.querySelector('.sql-copy-btn');
-  if (btn) {
-    btn.textContent = 'Copied!';
-    setTimeout(() => btn.textContent = 'Copy', 1500);
-  }
-}
+"""
+CRITICAL PYTHON RULES — VIOLATIONS CAUSE RUNTIME ERRORS:
+- All Chart.js code lives INSIDE a Python string (the html variable). It is NOT executed as Python.
+- Never use JavaScript variable names (`context`, `ctx`, `chart`, `datasets`, `labels`)
+  as Python variable names outside the html string.
+- The only Python variables available are: `data` (list of dicts), `output_path` (str), `json` (module).
+- Extract labels/values in Python like this:
+    labels = [row['ColumnName'] for row in data]
+    values = [row['NumericCol'] for row in data]
+  Then embed with json.dumps():
+    html = f'...<script>const labels = {json.dumps(labels)};</script>...'
+- Never write `ctx = ...` or `context = ...` in Python — these are JS-only names.
+- Never call any function that isn't defined in your own code or in Python builtins.
+- The roundTopPlugin must be defined entirely inside the HTML string as JavaScript.
+  Do NOT attempt to write it as Python code.
+"""
