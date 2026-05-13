@@ -1,16 +1,75 @@
+# ── Execute with one self-correction retry ──────────────────────
+MAX_CODE_RETRIES = 2
+
+last_error = None
+for code_attempt in range(1, MAX_CODE_RETRIES + 1):
+    # Strip markdown fences each attempt
+    clean_code = re.sub(r"^```python\s*", "", code, flags=re.IGNORECASE)
+    clean_code = re.sub(r"^```\s*", "", clean_code)
+    clean_code = re.sub(r"```$", "", clean_code).strip()
+
+    timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug        = re.sub(r"\W+", "_", question[:40]).strip("_").lower()
+    output_path = str(_ensure_dir(OUTPUT_DIR) / f"chart_{slug}__{timestamp}.html")
+
+    import json as _json
+    exec_globals = {
+        "data":         data,
+        "output_path":  output_path,
+        "json":         _json,
+        "__builtins__": __builtins__,
+    }
+
+    # Parse actual chart type from first-line comment
+    actual_chart_type = viz_meta.chart_type
+    first_line = clean_code.strip().splitlines()[0] if clean_code.strip() else ""
+    chart_type_match = re.search(r"#\s*CHART_TYPE:\s*(\w+)", first_line, re.IGNORECASE)
+    if chart_type_match:
+        actual_chart_type = chart_type_match.group(1).lower()
+
+    try:
+        exec(clean_code, exec_globals)  # nosec
+        return PlotlyResult(
+            success           = True,
+            code              = clean_code,
+            output_html       = output_path,
+            actual_chart_type = actual_chart_type,
+        )
+    except Exception as exc:
+        last_error = str(exc)
+        logger.warning(
+            "PlotlyCodeAgent exec failed (attempt %d/%d): %s",
+            code_attempt, MAX_CODE_RETRIES, last_error
+        )
+
+        if code_attempt < MAX_CODE_RETRIES:
+            # Feed the error back to Gemini to fix the code
+            fix_prompt = f"""The following Python code failed with this error:
+
+ERROR: {last_error}
+
+FAILED CODE:
+{clean_code}
+
+Fix ONLY the Python error. Rules:
+- Output ONLY raw Python code, no markdown, no backticks, no explanation.
+- The variables `data`, `output_path`, `json` are already defined — do not redefine them.
+- Do NOT use any variable named `context` — use `ctx` for canvas context inside JS strings only.
+- If the error is a NameError, check that all Python variable names are defined before use.
+- Keep the first line comment: # CHART_TYPE: {actual_chart_type}
 """
-CRITICAL PYTHON RULES — VIOLATIONS CAUSE RUNTIME ERRORS:
-- All Chart.js code lives INSIDE a Python string (the html variable). It is NOT executed as Python.
-- Never use JavaScript variable names (`context`, `ctx`, `chart`, `datasets`, `labels`)
-  as Python variable names outside the html string.
-- The only Python variables available are: `data` (list of dicts), `output_path` (str), `json` (module).
-- Extract labels/values in Python like this:
-    labels = [row['ColumnName'] for row in data]
-    values = [row['NumericCol'] for row in data]
-  Then embed with json.dumps():
-    html = f'...<script>const labels = {json.dumps(labels)};</script>...'
-- Never write `ctx = ...` or `context = ...` in Python — these are JS-only names.
-- Never call any function that isn't defined in your own code or in Python builtins.
-- The roundTopPlugin must be defined entirely inside the HTML string as JavaScript.
-  Do NOT attempt to write it as Python code.
-"""
+            try:
+                fix_response = self._llm.invoke(fix_prompt)
+                if token_log is not None:
+                    token_log.append(_extract_tokens(fix_response))
+                code = fix_response.content.strip()
+            except Exception as fix_exc:
+                logger.warning("Code fix attempt failed: %s", fix_exc)
+                break  # give up, return error below
+
+return PlotlyResult(
+    success           = False,
+    code              = clean_code,
+    error             = f"Code execution failed after {MAX_CODE_RETRIES} attempts: {last_error}",
+    actual_chart_type = actual_chart_type,
+)
