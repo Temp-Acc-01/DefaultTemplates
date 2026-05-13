@@ -1,95 +1,110 @@
-AXIS LABEL RULES (MANDATORY — never skip these):
-- For bar, line, area, scatter charts: ALWAYS set both x and y axis titles.
-- Use the EXACT column name from X Axis and Y Axis metadata as the label text.
-- Never leave axis titles empty, undefined, or omit the title config block.
-- Required config for every x and y axis:
-    scales: {
-      x: {
-        title: { display: true, text: '<X Axis column name>', font: { size: 12, family: "'DM Sans', sans-serif" }, color: '#7A8BA8', padding: { top: 8 } },
-        ...
+def _extract_tokens(response) -> int:
+    """Extract total token count from a LangChain Gemini response."""
+    try:
+        usage = getattr(response, 'usage_metadata', None)
+        if usage:
+            return usage.get('total_tokens', 0)
+        meta  = getattr(response, 'response_metadata', {})
+        usage2 = meta.get('usage_metadata', {})
+        if usage2:
+            return usage2.get('total_token_count', 0)
+    except Exception:
+        pass
+    return 0
+
+
+
+
+
+
+
+
+
+
+
+----------------
+
+
+def stream_query(self, question, pinned_tables=None, max_retries=None):
+    ...
+    token_log = []   # ← add at the top of stream_query, after max_retries resolve
+
+    # Agent 0 — pass token_log
+    relevant, selector_reasoning = self._selector.select(
+        all_schemas=..., question=question,
+        available_tables=..., pinned_tables=None,
+        token_log=token_log,               # ← add
+    )
+
+    # Agent 1 — pass token_log inside the loop
+    sql = self._gen_chain.generate(
+        schema=schema, question=question,
+        prev_sql=prev_sql, error=error,
+        lint_warnings=lint_warns, dialect=dialect,
+        token_log=token_log,               # ← add
+    )
+
+    # Agent 2 — pass token_log
+    is_valid, result_df, val_error, lint_warns = self._validator.validate(
+        sql=sql, schema=schema, question=question,
+        tables_used=relevant, skip_semantic=attempt > 1,
+        token_log=token_log,               # ← add
+    )
+
+    # Agent 3 — pass token_log
+    viz = self._viz_agent.generate(
+        question=question, sql=sql,
+        columns=cols, sample_data=data,
+        token_log=token_log,               # ← add
+    )
+
+    # Agent 4 — pass token_log
+    plotly_result = self._plotly.generate(
+        question=question, viz_meta=viz,
+        columns=cols, data=data,
+        token_log=token_log,               # ← add
+    )
+
+    # done event — include total tokens
+    yield sse("done", {"total_tokens": sum(token_log)})   # ← replace yield sse("done", {})
+
+
+
+-----------
+
+
+// Replace the existing addOrReplaceTimestamp function:
+function addOrReplaceTimestamp(tokens) {
+  if (tsSpan) tsSpan.remove();
+  tsSpan = document.createElement('span');
+  tsSpan.className = 'msg-ts';
+  const timeStr = nowTs();
+  tsSpan.textContent = tokens != null
+    ? `${tokens.toLocaleString()} tokens | ${timeStr}`
+    : timeStr;
+  bw.appendChild(tsSpan);
+}
+
+
+--------------
+
+
+
+case 'done': {
+  fetchDone = true;
+  const totalTokens = payload.total_tokens ?? null;
+  addOrReplaceTimestamp(totalTokens);   // ← final timestamp update with tokens
+  if (resultData) {
+    currentSession.messages.push({
+      role: 'ai', type: 'result',
+      snapshot: {
+        thinking:  thinkingBlock,
+        meta:      metaBlock,
+        sql:       sqlBlock,
+        chart:     chartBlock,
+        rowsBadge: rowsBadge,
       },
-      y: {
-        title: { display: true, text: '<Y Axis column name>', font: { size: 12, family: "'DM Sans', sans-serif" }, color: '#7A8BA8', padding: { bottom: 8 } },
-        ...
-      }
-    }
-- For pie/doughnut: no axis titles needed — skip this rule.
-- For table/heatmap: no axis titles needed — skip this rule.
-
-
-
----------------------------
-
-
-# REPLACE these two lines in _VIZ_SYSTEM:
-X_AXIS: <exact column name or alias from Result Columns to use as primary/category axis, or NONE>
-Y_AXIS: <exact column name or alias from Result Columns to use as primary value axis, or NONE>
-
-# WITH:
-X_AXIS: <exact column name or alias from Result Columns to use as primary/category axis.
-         MANDATORY for bar, line, area, scatter — must NEVER be NONE for these chart types.
-         Use NONE only for pie, heatmap, table.>
-Y_AXIS: <exact column name or alias from Result Columns to use as primary value axis.
-         MANDATORY for bar, line, area, scatter — must NEVER be NONE for these chart types.
-         Pick the numeric column. Use NONE only for pie, heatmap, table.>
-
-
-
-
------------------------
-
-
-# In VizMetaAgent.generate(), after the _parse calls — add this block:
-
-chosen_type = (_parse("CHART_TYPE") or "table").lower()
-x_axis      = _parse("X_AXIS")
-y_axis      = _parse("Y_AXIS")
-
-# Enforce: bar, line, area, scatter MUST have x and y axis
-REQUIRES_AXES = {"bar", "line", "area", "scatter"}
-if chosen_type in REQUIRES_AXES:
-    cols = columns  # columns list passed into generate()
-    numeric_cols = [c for c in cols if any(
-        kw in c.lower() for kw in ["count","total","sum","avg","amount","value","num","score","rate","pct"]
-    )]
-    category_cols = [c for c in cols if c not in numeric_cols]
-
-    if not x_axis and category_cols:
-        x_axis = category_cols[0]
-        logger.warning("VizMetaAgent: x_axis was None for %s — defaulting to '%s'", chosen_type, x_axis)
-    elif not x_axis and cols:
-        x_axis = cols[0]
-
-    if not y_axis and numeric_cols:
-        y_axis = numeric_cols[0]
-        logger.warning("VizMetaAgent: y_axis was None for %s — defaulting to '%s'", chosen_type, y_axis)
-    elif not y_axis and len(cols) > 1:
-        y_axis = cols[1]
-
-return VizMeta(
-    chart_type     = chosen_type,
-    title          = _parse("TITLE") or question[:60],
-    x_axis         = x_axis,
-    y_axis         = y_axis,
-    secondary_axis = _parse("SECONDARY_AXIS"),
-    series_label   = _parse("SERIES_LABEL"),
-    reasoning      = _parse("REASONING") or "",
-)
-
-
-
-
-
---------------------------
-
-
-
-def generate(self, question: str, sql: str, columns: list, sample_data: list) -> VizMeta:
-    # columns is now used in the fallback enforcement block above
-
-
-
-
-----------------------
-
-
+    });
+  }
+  break;
+}
