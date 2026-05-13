@@ -1,0 +1,233 @@
+_PLOTLY_SYSTEM = """
+You are an expert Python data visualization engineer using Plotly.
+Given a user's question, SQL query result data, and chart metadata,
+write complete executable Python code that generates the chart and saves it as an HTML file.
+
+CRITICAL RULE: You MUST use EXACTLY the chart type specified in Chart Metadata.
+Do NOT substitute a different chart type under any circumstances, even if you
+think another type would look better. The chart type has already been decided.
+
+Rules:
+1. Return ONLY raw Python code — no markdown, no backticks, no explanation.
+
+
+
+
+-----------------------------------
+
+7. Plot ALL rows from the data — do NOT slice, filter, or limit the dataset in any way.
+   Use the complete `data` variable as-is. Do not add .head(), .tail(), [:N], or TOP N anywhere.
+
+
+-------------------------------------------------------
+
+
+1. Return ONLY raw Python code — no markdown, no backticks, no explanation.
+   The very first line of your code MUST be a comment declaring the chart type you used:
+   # CHART_TYPE: bar
+   Use exactly one of: bar, line, pie, scatter, area, heatmap, table
+
+
+
+
+
+-----------------------------
+
+@dataclass
+class PlotlyResult:
+    success:           bool
+    code:              str           = ""
+    output_html:       Optional[str] = None
+    error:             Optional[str] = None
+    actual_chart_type: Optional[str] = None   # what Agent 4 actually plotted
+
+
+-----------------------------------------
+
+
+# Parse actual chart type from first-line comment
+actual_chart_type = viz_meta.chart_type  # fallback to what was requested
+first_line = code.strip().splitlines()[0] if code.strip() else ""
+chart_type_match = re.search(r"#\s*CHART_TYPE:\s*(\w+)", first_line, re.IGNORECASE)
+if chart_type_match:
+    actual_chart_type = chart_type_match.group(1).lower()
+    if actual_chart_type != viz_meta.chart_type:
+        logger.info(
+            "PlotlyCodeAgent overrode chart type: '%s' → '%s'",
+            viz_meta.chart_type, actual_chart_type,
+        )
+
+try:
+    exec(code, exec_globals)   # nosec — LLM-generated plotly code only
+    return PlotlyResult(
+        success           = True,
+        code              = code,
+        output_html       = output_path,
+        actual_chart_type = actual_chart_type,
+    )
+except Exception as exc:
+    return PlotlyResult(
+        success           = False,
+        code              = code,
+        error             = f"Code execution failed: {exc}",
+        actual_chart_type = actual_chart_type,
+    )
+
+
+
+------------------------------
+
+
+# ── Agent 4: Plotly chart ──────────────────────────────────────────────────
+plotly_result = self._plotly.generate(
+    question=question,
+    viz_meta=viz,
+    columns=cols,
+    data=data,
+)
+
+# Reconcile: if Agent 4 used a different chart type, update viz so
+# the metadata SSE and final response reflect what was actually plotted
+chart_type_changed = (
+    plotly_result.actual_chart_type and
+    plotly_result.actual_chart_type != viz.chart_type
+)
+if chart_type_changed:
+    logger.info(
+        "Reconciling viz_meta chart_type: '%s' → '%s'",
+        viz.chart_type, plotly_result.actual_chart_type,
+    )
+    viz.chart_type = plotly_result.actual_chart_type
+
+yield sse("chart_ready", {
+    "output_html":      plotly_result.output_html,
+    "plotly_code":      plotly_result.code,
+    "error":            plotly_result.error,
+    "actual_chart_type": viz.chart_type,   # always the final reconciled type
+    "chart_type_changed": chart_type_changed,
+})
+
+
+-----------------------------------
+
+
+# ── Agent 4 — Plotly chart ──
+plotly_result = self._plotly.generate(
+    question = question,
+    viz_meta = viz,
+    columns  = cols,
+    data     = data,
+)
+
+# Reconcile chart type
+if plotly_result.actual_chart_type and plotly_result.actual_chart_type != viz.chart_type:
+    viz.chart_type = plotly_result.actual_chart_type
+
+# Build column_roles map from viz metadata
+
+
+---------------------------
+
+
+
+case 'chart_ready': {
+  // Reconcile metadata card if Agent 4 used a different chart type
+  if (payload.chart_type_changed && payload.actual_chart_type && metaBlock) {
+    const chartPill = metaBlock.querySelector('.meta-pill.chart');
+    if (chartPill) {
+      chartPill.textContent = payload.actual_chart_type;
+    }
+    // Update local vizData so snapshot is also correct
+    if (vizData) vizData.chart_type = payload.actual_chart_type;
+  }
+
+  if (payload.output_html) {
+    const chartFile = payload.output_html.split('/').pop();
+    chartBlock = buildChartFrame(chartFile, vizData?.title || 'Chart');
+
+
+
+-----------------------------------
+
+
+_GENERATOR_SYSTEM = """
+You are an expert SQL engineer. Convert the user's natural language question into
+a valid MS SQL Server (T-SQL) query using the provided table schemas.
+
+Rules:
+1.  Return ONLY the raw SQL — no markdown, no backticks, no explanation, no comments.
+2.  Use the EXACT table and column names from the schema — case-sensitive, no guessing.
+3.  Always use [dbo].[TableName] format for ALL table references.
+4.  Always qualify columns as alias.[ColumnName] when multiple tables are involved.
+5.  Use square brackets for ALL identifiers: [ColumnName], [TableName]. NEVER double quotes.
+6.  Use JOINs only when the question genuinely requires data from multiple tables.
+7.  If aggregation is needed, include GROUP BY with ALL non-aggregate SELECT columns.
+8.  Do NOT compare VARCHAR columns with numeric literals — cast if needed.
+9.  Do NOT end with a semicolon.
+10. Use TOP N instead of LIMIT N.
+11. Use GETDATE() instead of NOW() or CURRENT_DATE.
+12. ALWAYS alias every aggregation or CAST with a clean readable name:
+      COUNT(*)              AS total_count
+      SUM(t.[Revenue])      AS total_revenue
+      AVG(CAST(t.[Price] AS FLOAT)) AS avg_price
+13. NEVER leave any aggregation or CAST expression without an AS alias.
+14. If the question is ambiguous, make the most reasonable single interpretation
+    and generate one query — do not ask clarifying questions.
+15. Output exactly one SQL SELECT statement — nothing else.
+"""
+
+
+--------------------------------
+
+
+def _execute(self, sql: str, tables_used: list = None):
+    try:
+        if tables_used and self._loader.uses_mssql_tables(tables_used):
+            df = self._loader.execute_on_mssql(sql)
+        else:
+            df = self._loader.execute(sql)
+        if df is None or (hasattr(df, 'empty') and df.empty and len(df.columns) == 0):
+            return False, None, "Query returned no columns — likely a schema mismatch."
+        return True, df, None
+    except Exception as exc:
+        return False, None, str(exc)
+
+
+
+
+-----------------------------------
+
+
+
+def validate(self, sql: str, schema: str, question: str,
+             tables_used: list = None, skip_semantic: bool = False):
+    """Returns (is_valid, result_df_or_None, error_or_None, lint_warnings)."""
+    lint_warns              = self._lint(sql)
+    ok, result_df, exec_err = self._execute(sql, tables_used=tables_used)
+
+    if not ok:
+        return False, None, exec_err, lint_warns
+
+    # Skip semantic check when caller requests it (e.g. retry attempts)
+    if not skip_semantic:
+        sem_ok, sem_reason = self._semantic(schema, question, sql)
+        if not sem_ok:
+            return False, None, f"Semantic mismatch: {sem_reason}", lint_warns
+
+    return True, result_df, None, lint_warns
+
+
+-----------------------------------
+
+
+
+for attempt in range(1, max_retries + 2):
+    # ... generate sql ...
+
+    is_valid, result_df, val_error, lint_warns = self._validator.validate(
+        sql          = sql,
+        schema       = schema,
+        question     = question,
+        tables_used  = relevant,
+        skip_semantic = attempt > 1,   # ← only semantic-check first attempt
+    )
