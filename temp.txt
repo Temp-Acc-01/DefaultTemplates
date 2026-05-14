@@ -1,868 +1,1198 @@
-"""
-db_metadata_enricher.py
-========================
-One-time metadata generation module for MS SQL Server tables via SSH tunnel.
+/**
+ * datatable_module.js  —  Sarthi Rich Datatable
+ * 
+ * Usage:
+ *   SarthiDatatable.open(csvUrl, title)   — open modal and load CSV
+ *   SarthiDatatable.close()               — close modal
+ * 
+ * Dependencies: Chart.js (loaded lazily from CDN if not present)
+ * No other external dependencies.
+ */
 
-For each table + column it computes:
-  - Total rows
-  - Per-column: null count, not-null count, unique count, duplicate count,
-    null %, top 10 distinct values (text cols only), min/max (numeric/date cols)
-  - LLM-generated descriptions: table-level and column-level using Gemini 2.5 Pro
+(function (global) {
+  'use strict';
 
-Results stored in a single JSON file with hierarchy:
-  db_name -> table_name -> { table_meta, columns: { col_name -> col_meta } }
+  /* ═══════════════════════════════════════════════════════════════════════
+     CONSTANTS & CONFIG
+  ═══════════════════════════════════════════════════════════════════════ */
+  const VIRTUAL_ROW_H  = 36;   // px per row
+  const VIRTUAL_BUFFER = 30;   // extra rows above/below viewport
+  const PAGE_SIZE      = 80;   // rows rendered per paint
+  const CHARTJS_CDN    = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js';
 
-On Flask app restart:
-  - Loads existing JSON
-  - Detects newly added tables not yet covered
-  - Runs enrichment only on new tables
-  - Merges and saves back
+  const PASTEL = [
+    'rgba(168,197,218,0.85)', 'rgba(181,213,197,0.85)', 'rgba(201,184,232,0.85)',
+    'rgba(242,196,206,0.85)', 'rgba(250,217,161,0.85)', 'rgba(168,216,185,0.85)',
+  ];
 
-Integration points (see bottom of file for instructions):
-  - Called from app.py at startup BEFORE loading schema
-  - Enriched descriptions injected into TableMeta.schema_info
-  - Fed to Agent 0 (table selection) and Agent 1 (SQL generation)
-"""
+  /* ═══════════════════════════════════════════════════════════════════════
+     STATE
+  ═══════════════════════════════════════════════════════════════════════ */
+  let _state = {
+    rawData:       [],   // parsed CSV rows (array of objects)
+    columns:       [],   // [{name, type, stats, uniqueVals}]
+    filteredData:  [],   // rows after all filters applied
+    filters:       {},   // { colName: { text, selected, min, max } }
+    sortCol:       null,
+    sortDir:       'asc',
+    csvUrl:        null,
+    title:         '',
+    sparkCharts:   {},   // colName → Chart instance
+    panelOpen:     null, // colName whose filter panel is open
+    scrollTop:     0,
+    globalSearch:  '',
+  };
 
-import os
-import re
-import json
-import logging
-import pyodbc
-import paramiko
-from pathlib import Path
-from datetime import datetime
-from typing import Optional
+  /* ═══════════════════════════════════════════════════════════════════════
+     CSV PARSER  (handles quoted fields, commas inside quotes)
+  ═══════════════════════════════════════════════════════════════════════ */
+  function parseCSV(text) {
+    const lines = text.split(/\r?\n/);
+    if (lines.length < 2) return { headers: [], rows: [] };
 
-from sshtunnel import SSHTunnelForwarder
-from dotenv import load_dotenv
-import google.generativeai as genai
+    const headers = splitCSVLine(lines[0]);
+    const rows = [];
+    for (let i = 1; i < lines.length; i++) {
+      if (!lines[i].trim()) continue;
+      const vals = splitCSVLine(lines[i]);
+      const obj = {};
+      headers.forEach((h, j) => { obj[h] = vals[j] ?? ''; });
+      rows.push(obj);
+    }
+    return { headers, rows };
+  }
 
-load_dotenv()
+  function splitCSVLine(line) {
+    const result = [];
+    let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQ = !inQ; continue; }
+      if (ch === ',' && !inQ) { result.push(cur.trim()); cur = ''; continue; }
+      cur += ch;
+    }
+    result.push(cur.trim());
+    return result;
+  }
 
-logger = logging.getLogger(__name__)
+  /* ═══════════════════════════════════════════════════════════════════════
+     TYPE DETECTION & STATS
+  ═══════════════════════════════════════════════════════════════════════ */
+  function detectColumns(headers, rows) {
+    return headers.map(name => {
+      const vals = rows.map(r => r[name]).filter(v => v !== '' && v !== null && v !== undefined);
+      const numVals = vals.map(v => parseFloat(v)).filter(v => !isNaN(v));
+      const isNumeric = numVals.length / Math.max(vals.length, 1) > 0.85;
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config — reads from same env vars as nl_to_sql_main.py
-# ─────────────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL    = "gemini-2.5-pro"
+      if (isNumeric) {
+        numVals.sort((a, b) => a - b);
+        const min  = numVals[0] ?? 0;
+        const max  = numVals[numVals.length - 1] ?? 0;
+        const mean = numVals.reduce((a, b) => a + b, 0) / (numVals.length || 1);
+        const mid  = Math.floor(numVals.length / 2);
+        const median = numVals.length % 2 === 0
+          ? (numVals[mid - 1] + numVals[mid]) / 2
+          : numVals[mid];
+        const nullCount = rows.length - vals.length;
+        const hist = buildHistogram(numVals, 10);
+        return { name, type: 'numeric', stats: { min, max, mean, median, nullCount, hist }, uniqueVals: [] };
+      } else {
+        const freq = {};
+        vals.forEach(v => { freq[v] = (freq[v] || 0) + 1; });
+        const uniqueVals = Object.entries(freq)
+          .sort((a, b) => b[1] - a[1])
+          .map(([val, count]) => ({ val, count }));
+        const nullCount = rows.length - vals.length;
+        return { name, type: 'string', stats: { uniqueCount: uniqueVals.length, nullCount }, uniqueVals };
+      }
+    });
+  }
 
-SSH_HOST        = os.environ.get("SSH_HOST",      "3.108.55.154")
-SSH_USER        = os.environ.get("SSH_USER",      "ubuntu")
-SSH_PKEY_PATH   = os.environ.get("SSH_PKEY_PATH", "/home/shared/gaurav/dashboard_v2/module/pcsap-DB.pem")
-MSSQL_DB_HOST   = os.environ.get("MSSQL_DB_HOST", "16.0.2.77")
-MSSQL_DB_USER   = os.environ.get("MSSQL_DB_USER", "pcsap@readonly")
-MSSQL_DB_PASS   = os.environ.get("MSSQL_DB_PASS", "pcsap@123")
-MSSQL_DB_NAME   = os.environ.get("MSSQL_DB_NAME", "FCI")
+  function buildHistogram(sortedNums, bins) {
+    if (!sortedNums.length) return { bins: [], counts: [] };
+    const min = sortedNums[0], max = sortedNums[sortedNums.length - 1];
+    const step = (max - min) / bins || 1;
+    const counts = new Array(bins).fill(0);
+    const labels = [];
+    for (let i = 0; i < bins; i++) {
+      labels.push(+(min + i * step).toFixed(2));
+    }
+    sortedNums.forEach(v => {
+      const idx = Math.min(Math.floor((v - min) / step), bins - 1);
+      counts[idx]++;
+    });
+    return { labels, counts };
+  }
 
-METADATA_JSON   = Path(os.environ.get("METADATA_JSON", "db_metadata.json"))
+  /* ═══════════════════════════════════════════════════════════════════════
+     FILTER ENGINE
+  ═══════════════════════════════════════════════════════════════════════ */
+  function applyFilters() {
+    let data = _state.rawData;
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SSH Tunnel helper (standalone, does not depend on nl_to_sql_main)
-# ─────────────────────────────────────────────────────────────────────────────
-class _Tunnel:
-    def __init__(self):
-        self._tunnel = None
+    // Global search
+    if (_state.globalSearch) {
+      const q = _state.globalSearch.toLowerCase();
+      data = data.filter(row =>
+        Object.values(row).some(v => String(v).toLowerCase().includes(q))
+      );
+    }
 
-    def start(self):
-        pkey = paramiko.RSAKey.from_private_key_file(SSH_PKEY_PATH)
-        self._tunnel = SSHTunnelForwarder(
-            (SSH_HOST, 22),
-            ssh_username=SSH_USER,
-            ssh_pkey=pkey,
-            remote_bind_address=(MSSQL_DB_HOST, 1433),
-            set_keepalive=60,
-        )
-        self._tunnel.start()
-        logger.info("Enricher tunnel on port %d", self._tunnel.local_bind_port)
-        return self._tunnel.local_bind_port
+    // Per-column filters
+    _state.columns.forEach(col => {
+      const f = _state.filters[col.name];
+      if (!f) return;
 
-    def stop(self):
-        if self._tunnel:
-            self._tunnel.stop()
-
-    def get_connection(self, port: int):
-        conn_str = (
-            "DRIVER={ODBC Driver 18 for SQL Server};"
-            f"SERVER=127.0.0.1,{port};"
-            f"DATABASE={MSSQL_DB_NAME};"
-            f"UID={MSSQL_DB_USER};"
-            f"PWD={MSSQL_DB_PASS};"
-            "Encrypt=yes;TrustServerCertificate=yes;Connection Timeout=30;"
-        )
-        return pyodbc.connect(conn_str)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Statistical profiling — pure SQL, no pandas
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _profile_table(conn, table_name: str) -> dict:
-    """
-    Runs statistical SQL queries against one MS SQL table.
-    Returns a dict with row_count and per-column stats.
-    """
-    cursor = conn.cursor()
-
-    # ── Row count ─────────────────────────────────────────────────────────
-    cursor.execute(f"SELECT COUNT(*) FROM [dbo].[{table_name}]")
-    row_count = cursor.fetchone()[0]
-
-    # ── Column info ───────────────────────────────────────────────────────
-    cursor.execute("""
-        SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
-               IS_NULLABLE, ORDINAL_POSITION
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_CATALOG = ? AND TABLE_SCHEMA = 'dbo' AND TABLE_NAME = ?
-        ORDER BY ORDINAL_POSITION
-    """, MSSQL_DB_NAME, table_name)
-    col_info = cursor.fetchall()
-
-    columns = {}
-
-    for col in col_info:
-        col_name   = col[0]
-        data_type  = col[1].lower()
-        is_nullable= col[3]
-
-        col_stats = {
-            "data_type":    data_type,
-            "is_nullable":  is_nullable,
-            "total_rows":   row_count,
-            "null_count":   0,
-            "not_null_count": 0,
-            "null_pct":     0.0,
-            "unique_count": 0,
-            "duplicate_count": 0,
-            "top_values":   [],
-            "min_value":    None,
-            "max_value":    None,
-            "usability":    "ok",   # ok | sparse | mostly_null | empty
+      if (col.type === 'string') {
+        if (f.selected && f.selected.length > 0) {
+          data = data.filter(r => f.selected.includes(r[col.name]));
         }
+        if (f.text) {
+          const q = f.text.toLowerCase();
+          data = data.filter(r => String(r[col.name]).toLowerCase().includes(q));
+        }
+      } else {
+        if (f.min !== undefined && f.min !== '') {
+          data = data.filter(r => parseFloat(r[col.name]) >= parseFloat(f.min));
+        }
+        if (f.max !== undefined && f.max !== '') {
+          data = data.filter(r => parseFloat(r[col.name]) <= parseFloat(f.max));
+        }
+      }
+    });
 
-        if row_count == 0:
-            columns[col_name] = col_stats
-            continue
+    // Sort
+    if (_state.sortCol) {
+      const col = _state.columns.find(c => c.name === _state.sortCol);
+      const dir = _state.sortDir === 'asc' ? 1 : -1;
+      data = [...data].sort((a, b) => {
+        const av = a[_state.sortCol], bv = b[_state.sortCol];
+        if (col && col.type === 'numeric') {
+          return (parseFloat(av) - parseFloat(bv)) * dir;
+        }
+        return String(av).localeCompare(String(bv)) * dir;
+      });
+    }
 
-        # ── Null / not-null counts ─────────────────────────────────────
-        try:
-            cursor.execute(f"""
-                SELECT
-                    SUM(CASE WHEN [{col_name}] IS NULL THEN 1 ELSE 0 END),
-                    COUNT([{col_name}])
-                FROM [dbo].[{table_name}]
-            """)
-            r = cursor.fetchone()
-            null_count     = r[0] or 0
-            not_null_count = r[1] or 0
-            null_pct       = round(null_count / row_count * 100, 2) if row_count else 0
+    _state.filteredData = data;
+  }
 
-            col_stats["null_count"]     = null_count
-            col_stats["not_null_count"] = not_null_count
-            col_stats["null_pct"]       = null_pct
+  /* ═══════════════════════════════════════════════════════════════════════
+     VIRTUAL SCROLL RENDERER
+  ═══════════════════════════════════════════════════════════════════════ */
+  function renderVirtualRows(tableBody, scrollContainer) {
+    const data   = _state.filteredData;
+    const cols   = _state.columns;
+    const viewH  = scrollContainer.clientHeight;
+    const scrollTop = scrollContainer.scrollTop;
 
-            # Usability flag
-            if null_pct == 100:
-                col_stats["usability"] = "empty"
-            elif null_pct >= 80:
-                col_stats["usability"] = "mostly_null"
-            elif null_pct >= 40:
-                col_stats["usability"] = "sparse"
-            else:
-                col_stats["usability"] = "ok"
+    const startIdx = Math.max(0, Math.floor(scrollTop / VIRTUAL_ROW_H) - VIRTUAL_BUFFER);
+    const endIdx   = Math.min(data.length, startIdx + Math.ceil(viewH / VIRTUAL_ROW_H) + VIRTUAL_BUFFER * 2);
 
-        except Exception as e:
-            logger.warning("Null count failed for %s.%s: %s", table_name, col_name, e)
+    // Spacer top
+    const topH = startIdx * VIRTUAL_ROW_H;
+    // Spacer bottom
+    const botH = (data.length - endIdx) * VIRTUAL_ROW_H;
 
-        # ── Unique / duplicate counts ──────────────────────────────────
-        try:
-            cursor.execute(f"""
-                SELECT COUNT(DISTINCT [{col_name}])
-                FROM [dbo].[{table_name}]
-                WHERE [{col_name}] IS NOT NULL
-            """)
-            unique_count = cursor.fetchone()[0] or 0
-            col_stats["unique_count"]    = unique_count
-            col_stats["duplicate_count"] = max(0, not_null_count - unique_count)
-        except Exception as e:
-            logger.warning("Unique count failed for %s.%s: %s", table_name, col_name, e)
+    let html = `<tr style="height:${topH}px"><td colspan="${cols.length}" style="padding:0;border:none"></td></tr>`;
 
-        # ── Top 10 distinct values (text / categorical columns) ────────
-        text_types = {"varchar", "nvarchar", "char", "nchar", "text", "ntext"}
-        if data_type in text_types and col_stats["usability"] in ("ok", "sparse"):
-            try:
-                cursor.execute(f"""
-                    SELECT TOP 10 [{col_name}], COUNT(*) AS freq
-                    FROM [dbo].[{table_name}]
-                    WHERE [{col_name}] IS NOT NULL
-                      AND LTRIM(RTRIM(CAST([{col_name}] AS NVARCHAR(MAX)))) != ''
-                    GROUP BY [{col_name}]
-                    ORDER BY freq DESC
-                """)
-                rows = cursor.fetchall()
-                col_stats["top_values"] = [
-                    {"value": str(r[0]).strip(), "count": r[1]}
-                    for r in rows
-                ]
-            except Exception as e:
-                logger.warning("Top values failed for %s.%s: %s", table_name, col_name, e)
+    for (let i = startIdx; i < endIdx; i++) {
+      const row = data[i];
+      const rowClass = i % 2 === 0 ? 'dt-row-even' : 'dt-row-odd';
+      html += `<tr class="dt-row ${rowClass}">`;
+      cols.forEach(col => {
+        const val = row[col.name] ?? '';
+        const display = val === '' ? '<span class="dt-null">—</span>' : esc(String(val));
+        html += `<td class="dt-cell" title="${esc(String(val))}">${display}</td>`;
+      });
+      html += '</tr>';
+    }
 
-        # ── Min / Max (numeric + date cols) ───────────────────────────
-        numeric_types = {"int", "bigint", "smallint", "tinyint", "decimal",
-                         "numeric", "float", "real", "money", "smallmoney"}
-        date_types    = {"date", "datetime", "datetime2", "smalldatetime", "datetimeoffset"}
+    html += `<tr style="height:${botH}px"><td colspan="${cols.length}" style="padding:0;border:none"></td></tr>`;
+    tableBody.innerHTML = html;
+  }
 
-        if data_type in numeric_types | date_types and col_stats["usability"] in ("ok", "sparse"):
-            try:
-                cursor.execute(f"""
-                    SELECT MIN([{col_name}]), MAX([{col_name}])
-                    FROM [dbo].[{table_name}]
-                    WHERE [{col_name}] IS NOT NULL
-                """)
-                r = cursor.fetchone()
-                col_stats["min_value"] = str(r[0]) if r[0] is not None else None
-                col_stats["max_value"] = str(r[1]) if r[1] is not None else None
-            except Exception as e:
-                logger.warning("Min/max failed for %s.%s: %s", table_name, col_name, e)
+  /* ═══════════════════════════════════════════════════════════════════════
+     MODAL HTML STRUCTURE
+  ═══════════════════════════════════════════════════════════════════════ */
+  function buildModalHTML() {
+    return `
+<div id="sdt-overlay" style="
+  display:none; position:fixed; inset:0; z-index:2000;
+  background:rgba(15,25,50,0.52); backdrop-filter:blur(4px);
+  align-items:flex-end; justify-content:center; padding:0;
+  animation:sdtFadeIn 0.2s ease;
+">
+<div id="sdt-modal" style="
+  background:#F4F7FC; border-radius:18px 18px 0 0;
+  width:100%; height:90vh; display:flex; flex-direction:column;
+  box-shadow:0 -12px 48px rgba(15,25,50,0.18);
+  overflow:hidden; animation:sdtSlideUp 0.25s cubic-bezier(0.22,1,0.36,1);
+">
 
-        columns[col_name] = col_stats
+  <!-- TOP BAR -->
+  <div id="sdt-topbar" style="
+    display:flex; align-items:center; gap:12px; padding:12px 20px 11px;
+    background:#fff; border-bottom:1px solid rgba(100,130,180,0.13);
+    flex-shrink:0;
+  ">
+    <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:0;">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" style="color:#7A8BA8;flex-shrink:0">
+        <path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>
+      </svg>
+      <span id="sdt-title" style="font-size:13px;font-weight:500;color:#4A5E7A;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></span>
+      <span id="sdt-row-count" style="
+        font-size:11px; color:#7A8BA8; padding:2px 8px;
+        background:#F7F9FC; border:1px solid rgba(100,130,180,0.13);
+        border-radius:20px; white-space:nowrap; flex-shrink:0;
+      "></span>
+    </div>
 
-    return {"row_count": row_count, "columns": columns}
+    <!-- Global search -->
+    <div style="position:relative;flex-shrink:0;">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" style="
+        position:absolute;left:9px;top:50%;transform:translateY(-50%);color:#7A8BA8;pointer-events:none;
+      "><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      <input id="sdt-global-search" placeholder="Search all columns…" style="
+        padding:6px 10px 6px 28px; font-size:12.5px; font-family:'DM Sans',sans-serif;
+        border:1.5px solid rgba(100,130,180,0.22); border-radius:20px;
+        background:#F7F9FC; color:#1A2535; outline:none; width:200px;
+        transition:border-color 0.15s, box-shadow 0.15s;
+      "
+        onfocus="this.style.borderColor='#5BA3F5';this.style.boxShadow='0 0 0 3px rgba(59,130,246,0.08)'"
+        onblur="this.style.borderColor='rgba(100,130,180,0.22)';this.style.boxShadow='none'"
+      />
+    </div>
+
+    <!-- Reset filters -->
+    <button id="sdt-reset-btn" onclick="SarthiDatatable._resetAll()" style="
+      padding:5px 12px; font-size:11.5px; font-family:'DM Sans',sans-serif; font-weight:500;
+      border:1px solid rgba(100,130,180,0.22); border-radius:20px;
+      background:transparent; color:#7A8BA8; cursor:pointer;
+      transition:background 0.12s,color 0.12s; flex-shrink:0;
+    "
+      onmouseover="this.style.background='#EEF2F8';this.style.color='#1A2535'"
+      onmouseout="this.style.background='transparent';this.style.color='#7A8BA8'"
+    >Reset filters</button>
+
+    <!-- Close -->
+    <button onclick="SarthiDatatable.close()" style="
+      width:28px; height:28px; border-radius:8px; border:1px solid rgba(100,130,180,0.22);
+      background:transparent; color:#7A8BA8; display:flex; align-items:center; justify-content:center;
+      cursor:pointer; transition:background 0.12s,color 0.12s; flex-shrink:0;
+    "
+      onmouseover="this.style.background='#EEF2F8';this.style.color='#1A2535'"
+      onmouseout="this.style.background='transparent';this.style.color='#7A8BA8'"
+      title="Close"
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <path d="M18 6L6 18M6 6l12 12"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- ACTIVE FILTER CHIPS -->
+  <div id="sdt-chips" style="
+    display:none; flex-wrap:wrap; gap:6px; padding:8px 20px;
+    background:#fff; border-bottom:1px solid rgba(100,130,180,0.10);
+    flex-shrink:0;
+  "></div>
+
+  <!-- BODY: column stats bar + table -->
+  <div style="display:flex;flex-direction:column;flex:1;overflow:hidden;min-height:0;">
+
+    <!-- COLUMN STATS STRIP -->
+    <div id="sdt-stats-strip" style="
+      display:flex; overflow-x:auto; gap:0; flex-shrink:0;
+      background:#fff; border-bottom:1px solid rgba(100,130,180,0.13);
+      scrollbar-width:none;
+    "></div>
+
+    <!-- TABLE CONTAINER -->
+    <div id="sdt-table-container" style="
+      flex:1; overflow:auto; min-height:0;
+      scrollbar-width:thin; scrollbar-color:rgba(100,130,180,0.25) transparent;
+    ">
+      <table id="sdt-table" style="
+        border-collapse:collapse; width:100%; min-width:max-content;
+        font-size:12.5px; font-family:'DM Sans',sans-serif;
+      ">
+        <thead id="sdt-thead" style="position:sticky;top:0;z-index:10;"></thead>
+        <tbody id="sdt-tbody"></tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <!-- BOTTOM STATUS BAR -->
+  <div style="
+    display:flex; align-items:center; justify-content:space-between;
+    padding:8px 20px; background:#fff; border-top:1px solid rgba(100,130,180,0.13);
+    flex-shrink:0; font-size:11.5px; color:#7A8BA8;
+  ">
+    <span id="sdt-status-left"></span>
+    <span id="sdt-status-right" style="font-size:11px;opacity:0.7;">Sarthi Datatable</span>
+  </div>
+</div>
+</div>
+
+<!-- Filter panel (floating, appended to body) -->
+<div id="sdt-filter-panel" style="
+  display:none; position:fixed; z-index:3000;
+  background:#fff; border:1px solid rgba(100,130,180,0.22);
+  border-radius:12px; box-shadow:0 8px 32px rgba(15,25,50,0.14);
+  width:260px; overflow:hidden;
+  animation:sdtFadeIn 0.15s ease;
+"></div>
+
+<style>
+@keyframes sdtFadeIn  { from{opacity:0} to{opacity:1} }
+@keyframes sdtSlideUp { from{transform:translateY(40px);opacity:0} to{transform:translateY(0);opacity:1} }
+
+.dt-row { transition:background 0.08s; }
+.dt-row:hover td { background:rgba(91,163,245,0.06) !important; }
+.dt-row-even td { background:#fff; }
+.dt-row-odd  td { background:#F7F9FC; }
+.dt-cell {
+  padding:8px 14px; border-bottom:1px solid rgba(100,130,180,0.09);
+  white-space:nowrap; max-width:220px; overflow:hidden; text-overflow:ellipsis;
+  color:#1A2535; vertical-align:middle;
+}
+.dt-null { color:#C4CFDF; font-style:italic; }
+
+.dt-th {
+  padding:0; background:#EBF4FF; border-bottom:2px solid rgba(100,130,180,0.18);
+  border-right:1px solid rgba(100,130,180,0.10);
+  font-size:11.5px; font-weight:600; color:#1A4F9C; letter-spacing:0.2px;
+  white-space:nowrap; position:relative; user-select:none; vertical-align:top;
+}
+.dt-th-inner {
+  display:flex; align-items:center; gap:5px; padding:8px 12px 6px;
+  cursor:pointer; white-space:nowrap;
+}
+.dt-th-inner:hover { background:rgba(91,163,245,0.07); }
+
+.dt-sort-icon { opacity:0.35; flex-shrink:0; }
+.dt-sort-icon.active { opacity:1; color:#2979D9; }
+
+.dt-filter-btn {
+  display:flex; align-items:center; justify-content:center;
+  width:22px; height:22px; border-radius:6px; border:none;
+  background:transparent; cursor:pointer; color:#7A8BA8;
+  transition:background 0.12s, color 0.12s; flex-shrink:0; margin-left:auto;
+}
+.dt-filter-btn:hover { background:rgba(91,163,245,0.12); color:#2979D9; }
+.dt-filter-btn.active { background:#EBF4FF; color:#2979D9; }
+
+.dt-type-badge {
+  font-size:9px; font-weight:600; letter-spacing:0.5px; text-transform:uppercase;
+  padding:1px 5px; border-radius:4px; flex-shrink:0;
+}
+.dt-type-badge.numeric { background:#E6F7F4; color:#1A8C78; }
+.dt-type-badge.string  { background:#F0EEFE; color:#7066D4; }
+
+/* Stats strip card */
+.dt-stat-card {
+  flex-shrink:0; padding:8px 14px 6px; border-right:1px solid rgba(100,130,180,0.10);
+  min-width:140px; max-width:200px; cursor:default;
+  transition:background 0.12s;
+}
+.dt-stat-card:hover { background:#F7F9FC; }
+.dt-stat-label { font-size:9.5px; font-weight:600; letter-spacing:0.5px; text-transform:uppercase; color:#7A8BA8; margin-bottom:3px; }
+.dt-stat-val { font-size:11.5px; color:#1A2535; line-height:1.45; }
+.dt-stat-sub { font-size:10px; color:#7A8BA8; }
+
+/* Filter panel internals */
+.sdt-fp-section { padding:10px 14px; border-bottom:1px solid rgba(100,130,180,0.10); }
+.sdt-fp-label { font-size:10px; font-weight:600; letter-spacing:0.5px; text-transform:uppercase; color:#7A8BA8; margin-bottom:6px; }
+.sdt-fp-input {
+  width:100%; padding:6px 10px; font-size:12.5px; font-family:'DM Sans',sans-serif;
+  border:1.5px solid rgba(100,130,180,0.22); border-radius:8px;
+  background:#F7F9FC; color:#1A2535; outline:none; box-sizing:border-box;
+  transition:border-color 0.15s;
+}
+.sdt-fp-input:focus { border-color:#5BA3F5; background:#fff; }
+
+.sdt-chip {
+  display:inline-flex; align-items:center; gap:4px;
+  padding:3px 8px 3px 10px; border-radius:20px;
+  font-size:11px; font-weight:500;
+  background:#EBF4FF; color:#1A4F9C; border:1px solid #C8E2FF;
+  cursor:default;
+}
+.sdt-chip-x {
+  display:flex; align-items:center; justify-content:center;
+  width:14px; height:14px; border-radius:50%; border:none;
+  background:rgba(41,121,217,0.15); color:#2979D9; cursor:pointer;
+  font-size:10px; line-height:1; transition:background 0.12s;
+}
+.sdt-chip-x:hover { background:rgba(41,121,217,0.3); }
+
+.sdt-option {
+  display:flex; align-items:center; gap:8px; padding:5px 10px;
+  cursor:pointer; border-radius:6px; transition:background 0.1s;
+  font-size:12.5px; color:#1A2535;
+}
+.sdt-option:hover { background:#F0F4FF; }
+.sdt-option input[type=checkbox] { accent-color:#2979D9; width:13px; height:13px; flex-shrink:0; }
+
+#sdt-stats-strip::-webkit-scrollbar { display:none; }
+#sdt-table-container::-webkit-scrollbar { height:6px; width:6px; }
+#sdt-table-container::-webkit-scrollbar-thumb { background:rgba(100,130,180,0.25); border-radius:4px; }
+</style>
+`;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     RENDER HEADER
+  ═══════════════════════════════════════════════════════════════════════ */
+  function renderHeader() {
+    const thead = document.getElementById('sdt-thead');
+    let html = '<tr>';
+    _state.columns.forEach(col => {
+      const isSort   = _state.sortCol === col.name;
+      const sortDir  = _state.sortDir;
+      const hasFilter = hasActiveFilter(col.name);
+      const sortIcon = isSort
+        ? (sortDir === 'asc'
+            ? '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M7 14l5-5 5 5z"/></svg>'
+            : '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M7 10l5 5 5-5z"/></svg>')
+        : '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style="opacity:0.25"><path d="M7 10l5 5 5-5zm0-4l5 5 5-5z"/></svg>';
+
+      const typeLabel  = col.type === 'numeric' ? 'num' : 'str';
+      const typeCls    = col.type === 'numeric' ? 'numeric' : 'string';
+      const filterBtnCls = hasFilter ? 'dt-filter-btn active' : 'dt-filter-btn';
+
+      html += `<th class="dt-th" data-col="${esc(col.name)}">
+        <div class="dt-th-inner" onclick="SarthiDatatable._sortBy('${esc(col.name)}')">
+          <span class="dt-type-badge ${typeCls}">${typeLabel}</span>
+          <span style="overflow:hidden;text-overflow:ellipsis;max-width:130px;" title="${esc(col.name)}">${esc(col.name)}</span>
+          <span class="dt-sort-icon ${isSort ? 'active' : ''}">${sortIcon}</span>
+          <button class="${filterBtnCls}" title="Filter"
+            onclick="event.stopPropagation();SarthiDatatable._openFilterPanel('${esc(col.name)}', this)"
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M10 18h4v-2h-4v2zm-7-10v2h18V8H3zm3 6h12v-2H6v2z"/>
+            </svg>
+          </button>
+        </div>
+      </th>`;
+    });
+    html += '</tr>';
+    thead.innerHTML = html;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     RENDER STATS STRIP
+  ═══════════════════════════════════════════════════════════════════════ */
+  function renderStatsStrip() {
+    const strip = document.getElementById('sdt-stats-strip');
+    // Destroy existing spark charts
+    Object.values(_state.sparkCharts).forEach(c => { try { c.destroy(); } catch {} });
+    _state.sparkCharts = {};
+
+    let html = '';
+    _state.columns.forEach(col => {
+      if (col.type === 'numeric') {
+        const s = col.stats;
+        html += `<div class="dt-stat-card" style="min-width:180px">
+          <div class="dt-stat-label">${esc(col.name)}</div>
+          <canvas id="sdt-spark-${esc(col.name)}" height="28" style="width:100%;display:block;margin-bottom:3px;"></canvas>
+          <div class="dt-stat-val" style="display:flex;gap:8px;flex-wrap:wrap;">
+            <span title="Min" style="color:#2BBFA5">↓${fmt(s.min)}</span>
+            <span title="Max" style="color:#5BA3F5">↑${fmt(s.max)}</span>
+            <span title="Mean" style="color:#7066D4">μ${fmt(s.mean)}</span>
+            <span title="Median">M${fmt(s.median)}</span>
+          </div>
+          ${s.nullCount ? `<div class="dt-stat-sub">${s.nullCount} null${s.nullCount>1?'s':''}</div>` : ''}
+        </div>`;
+      } else {
+        const s = col.stats;
+        const topVals = (col.uniqueVals || []).slice(0, 3).map(u => esc(u.val)).join(', ');
+        html += `<div class="dt-stat-card" style="min-width:140px">
+          <div class="dt-stat-label">${esc(col.name)}</div>
+          <div class="dt-stat-val">${s.uniqueCount} unique</div>
+          <div class="dt-stat-sub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:170px;" title="${topVals}">${topVals || '—'}</div>
+          ${s.nullCount ? `<div class="dt-stat-sub">${s.nullCount} null${s.nullCount>1?'s':''}</div>` : ''}
+        </div>`;
+      }
+    });
+    strip.innerHTML = html;
+
+    // Draw sparkline histograms
+    _state.columns.forEach(col => {
+      if (col.type !== 'numeric') return;
+      const canvas = document.getElementById(`sdt-spark-${col.name}`);
+      if (!canvas || !global.Chart) return;
+      const hist = col.stats.hist;
+      try {
+        _state.sparkCharts[col.name] = new global.Chart(canvas, {
+          type: 'bar',
+          data: {
+            labels: hist.labels,
+            datasets: [{
+              data: hist.counts,
+              backgroundColor: 'rgba(91,163,245,0.45)',
+              borderColor: 'rgba(41,121,217,0.6)',
+              borderWidth: 1,
+              borderRadius: 2,
+            }]
+          },
+          options: {
+            responsive: false,
+            animation: false,
+            plugins: { legend: { display: false }, tooltip: { enabled: false } },
+            scales: {
+              x: { display: false },
+              y: { display: false, beginAtZero: true }
+            },
+            layout: { padding: 0 }
+          }
+        });
+      } catch {}
+    });
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     FILTER PANEL
+  ═══════════════════════════════════════════════════════════════════════ */
+  function openFilterPanel(colName, btnEl) {
+    const col    = _state.columns.find(c => c.name === colName);
+    const panel  = document.getElementById('sdt-filter-panel');
+    if (!col || !panel) return;
+
+    // If same col → toggle
+    if (_state.panelOpen === colName) {
+      closeFilterPanel();
+      return;
+    }
+    _state.panelOpen = colName;
+
+    // Position near button
+    const rect = btnEl.getBoundingClientRect();
+    const left = Math.min(rect.left, window.innerWidth - 275);
+    const top  = rect.bottom + 6;
+
+    panel.style.left    = left + 'px';
+    panel.style.top     = top  + 'px';
+    panel.style.display = 'block';
+
+    if (col.type === 'string') {
+      renderStringFilterPanel(col, panel);
+    } else {
+      renderNumericFilterPanel(col, panel);
+    }
+
+    // Close on outside click
+    setTimeout(() => {
+      document.addEventListener('click', _outsideFilterClose, { once: true });
+    }, 10);
+  }
+
+  function _outsideFilterClose(e) {
+    const panel = document.getElementById('sdt-filter-panel');
+    if (panel && !panel.contains(e.target)) {
+      closeFilterPanel();
+    }
+  }
+
+  function closeFilterPanel() {
+    const panel = document.getElementById('sdt-filter-panel');
+    if (panel) panel.style.display = 'none';
+    _state.panelOpen = null;
+  }
+
+  function renderStringFilterPanel(col, panel) {
+    const f         = _state.filters[col.name] || {};
+    const selected  = f.selected || [];
+    const searchTxt = f.text || '';
+    const topVals   = col.uniqueVals.slice(0, 200);
+    const filtered  = searchTxt
+      ? topVals.filter(u => u.val.toLowerCase().includes(searchTxt.toLowerCase()))
+      : topVals;
+
+    panel.innerHTML = `
+      <div style="padding:10px 14px 8px;border-bottom:1px solid rgba(100,130,180,0.10);display:flex;align-items:center;justify-content:space-between;">
+        <span style="font-size:11.5px;font-weight:600;color:#1A2535;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px;">${esc(col.name)}</span>
+        <span style="font-size:10.5px;color:#7A8BA8;">${col.stats.uniqueCount} unique</span>
+      </div>
+
+      <div class="sdt-fp-section">
+        <div class="sdt-fp-label">Search values</div>
+        <input class="sdt-fp-input" id="sdt-str-search" placeholder="Type to search…"
+          value="${esc(searchTxt)}"
+          oninput="SarthiDatatable._strSearchChange('${esc(col.name)}', this.value)"
+        />
+      </div>
+
+      <div class="sdt-fp-section" style="max-height:200px;overflow-y:auto;padding-top:6px;">
+        ${selected.length > 0 ? `
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+            <span style="font-size:10.5px;color:#7A8BA8;">${selected.length} selected</span>
+            <button onclick="SarthiDatatable._clearColFilter('${esc(col.name)}')"
+              style="font-size:10.5px;color:#5BA3F5;background:none;border:none;cursor:pointer;font-family:'DM Sans',sans-serif;"
+            >Clear</button>
+          </div>
+        ` : ''}
+        ${filtered.map(u => `
+          <div class="sdt-option">
+            <input type="checkbox" ${selected.includes(u.val) ? 'checked' : ''}
+              onchange="SarthiDatatable._toggleValFilter('${esc(col.name)}', '${esc(u.val)}')"
+            />
+            <span style="flex:1;overflow:hidden;text-overflow:ellipsis;" title="${esc(u.val)}">${esc(u.val)}</span>
+            <span style="font-size:10px;color:#7A8BA8;flex-shrink:0;">${u.count}</span>
+          </div>`).join('')}
+        ${filtered.length === 0 ? '<div style="font-size:12px;color:#7A8BA8;text-align:center;padding:12px 0;">No values found</div>' : ''}
+      </div>
+    `;
+  }
+
+  function renderNumericFilterPanel(col, panel) {
+    const f   = _state.filters[col.name] || {};
+    const s   = col.stats;
+    const mn  = f.min !== undefined ? f.min : '';
+    const mx  = f.max !== undefined ? f.max : '';
+
+    panel.innerHTML = `
+      <div style="padding:10px 14px 8px;border-bottom:1px solid rgba(100,130,180,0.10);display:flex;align-items:center;justify-content:space-between;">
+        <span style="font-size:11.5px;font-weight:600;color:#1A2535;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px;">${esc(col.name)}</span>
+        <span style="font-size:10.5px;color:#7A8BA8;">numeric</span>
+      </div>
+
+      <div class="sdt-fp-section">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;">
+          <div>
+            <div class="sdt-fp-label">Min</div>
+            <input class="sdt-fp-input" type="number" id="sdt-num-min"
+              placeholder="${fmt(s.min)}" value="${mn}"
+              oninput="SarthiDatatable._numFilterChange('${esc(col.name)}')"
+            />
+          </div>
+          <div>
+            <div class="sdt-fp-label">Max</div>
+            <input class="sdt-fp-input" type="number" id="sdt-num-max"
+              placeholder="${fmt(s.max)}" value="${mx}"
+              oninput="SarthiDatatable._numFilterChange('${esc(col.name)}')"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div class="sdt-fp-section" style="padding-top:2px;">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;text-align:center;">
+          <div>
+            <div class="sdt-fp-label">Range</div>
+            <div style="font-size:11.5px;color:#2BBFA5;">↓${fmt(s.min)}</div>
+            <div style="font-size:11.5px;color:#5BA3F5;">↑${fmt(s.max)}</div>
+          </div>
+          <div>
+            <div class="sdt-fp-label">Stats</div>
+            <div style="font-size:11.5px;color:#7066D4;">μ ${fmt(s.mean)}</div>
+            <div style="font-size:11.5px;color:#1A2535;">M ${fmt(s.median)}</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="padding:8px 14px;">
+        <button onclick="SarthiDatatable._clearColFilter('${esc(col.name)}')"
+          style="width:100%;padding:6px;font-size:11.5px;font-family:'DM Sans',sans-serif;font-weight:500;
+          border:1px solid rgba(100,130,180,0.22);border-radius:8px;background:transparent;color:#7A8BA8;
+          cursor:pointer;transition:background 0.12s;"
+          onmouseover="this.style.background='#F0F4FF';this.style.color='#1A2535'"
+          onmouseout="this.style.background='transparent';this.style.color='#7A8BA8'"
+        >Clear filter</button>
+      </div>
+    `;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     FILTER CHIPS
+  ═══════════════════════════════════════════════════════════════════════ */
+  function renderChips() {
+    const chips    = document.getElementById('sdt-chips');
+    const hasAny   = Object.keys(_state.filters).some(k => hasActiveFilter(k));
+    const hasGlobal = !!_state.globalSearch;
+
+    if (!chips) return;
+    if (!hasAny && !hasGlobal) { chips.style.display = 'none'; chips.innerHTML = ''; return; }
+    chips.style.display = 'flex';
+
+    let html = '';
+    if (hasGlobal) {
+      html += `<span class="sdt-chip">
+        Search: "${esc(_state.globalSearch)}"
+        <button class="sdt-chip-x" onclick="SarthiDatatable._clearGlobal()">×</button>
+      </span>`;
+    }
+    Object.entries(_state.filters).forEach(([col, f]) => {
+      const colMeta = _state.columns.find(c => c.name === col);
+      if (!colMeta) return;
+      if (colMeta.type === 'string') {
+        if (f.selected && f.selected.length) {
+          const label = f.selected.length === 1 ? esc(f.selected[0]) : `${f.selected.length} values`;
+          html += `<span class="sdt-chip">
+            ${esc(col)}: ${label}
+            <button class="sdt-chip-x" onclick="SarthiDatatable._clearColFilter('${esc(col)}')">×</button>
+          </span>`;
+        }
+        if (f.text) {
+          html += `<span class="sdt-chip">
+            ${esc(col)} contains "${esc(f.text)}"
+            <button class="sdt-chip-x" onclick="SarthiDatatable._clearColFilter('${esc(col)}')">×</button>
+          </span>`;
+        }
+      } else {
+        if (f.min !== '' && f.min !== undefined) {
+          html += `<span class="sdt-chip">
+            ${esc(col)} ≥ ${fmt(f.min)}
+            <button class="sdt-chip-x" onclick="SarthiDatatable._clearColFilter('${esc(col)}')">×</button>
+          </span>`;
+        }
+        if (f.max !== '' && f.max !== undefined) {
+          html += `<span class="sdt-chip">
+            ${esc(col)} ≤ ${fmt(f.max)}
+            <button class="sdt-chip-x" onclick="SarthiDatatable._clearColFilter('${esc(col)}')">×</button>
+          </span>`;
+        }
+      }
+    });
+    chips.innerHTML = html;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     STATUS BAR
+  ═══════════════════════════════════════════════════════════════════════ */
+  function updateStatus() {
+    const left  = document.getElementById('sdt-status-left');
+    const count = document.getElementById('sdt-row-count');
+    const total = _state.rawData.length;
+    const shown = _state.filteredData.length;
+
+    const filterActive = shown < total;
+    const txt = filterActive
+      ? `${shown.toLocaleString()} of ${total.toLocaleString()} rows · ${_state.columns.length} columns`
+      : `${total.toLocaleString()} rows · ${_state.columns.length} columns`;
+    if (left)  left.textContent  = txt;
+    if (count) count.textContent = txt;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     MAIN REFRESH  (called after every filter/sort change)
+  ═══════════════════════════════════════════════════════════════════════ */
+  function refresh() {
+    applyFilters();
+    renderHeader();
+    const tbody = document.getElementById('sdt-tbody');
+    const cont  = document.getElementById('sdt-table-container');
+    if (tbody && cont) renderVirtualRows(tbody, cont);
+    renderChips();
+    updateStatus();
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     LOADING STATE
+  ═══════════════════════════════════════════════════════════════════════ */
+  function showLoading(msg) {
+    const tbody = document.getElementById('sdt-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = `<tr><td colspan="100" style="
+      text-align:center; padding:60px 20px; color:#7A8BA8; font-size:13.5px;
+    ">
+      <div style="display:flex;align-items:center;justify-content:center;gap:8px;">
+        <div style="width:6px;height:6px;border-radius:50%;background:#5BA3F5;animation:sdtPulse 1.2s ease-in-out infinite"></div>
+        <div style="width:6px;height:6px;border-radius:50%;background:#5BA3F5;animation:sdtPulse 1.2s ease-in-out 0.2s infinite"></div>
+        <div style="width:6px;height:6px;border-radius:50%;background:#5BA3F5;animation:sdtPulse 1.2s ease-in-out 0.4s infinite"></div>
+      </div>
+      <div style="margin-top:12px;">${esc(msg)}</div>
+      <style>@keyframes sdtPulse{0%,80%,100%{transform:scale(0.8);opacity:0.4}40%{transform:scale(1.2);opacity:1}}</style>
+    </td></tr>`;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     CHART.JS LOADER
+  ═══════════════════════════════════════════════════════════════════════ */
+  function ensureChartJS(cb) {
+    if (global.Chart) { cb(); return; }
+    const s = document.createElement('script');
+    s.src = CHARTJS_CDN;
+    s.onload  = cb;
+    s.onerror = cb; // proceed anyway
+    document.head.appendChild(s);
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     PUBLIC API
+  ═══════════════════════════════════════════════════════════════════════ */
+  const SarthiDatatable = {
+
+    /** Open the datatable modal for a given CSV URL */
+    open(csvUrl, title) {
+      _state.csvUrl       = csvUrl;
+      _state.title        = title || 'Data Table';
+      _state.filters      = {};
+      _state.sortCol      = null;
+      _state.sortDir      = 'asc';
+      _state.globalSearch = '';
+      _state.panelOpen    = null;
+
+      // Build modal if not exists
+      if (!document.getElementById('sdt-overlay')) {
+        const div = document.createElement('div');
+        div.innerHTML = buildModalHTML();
+        document.body.appendChild(div);
+      }
+
+      const overlay = document.getElementById('sdt-overlay');
+      overlay.style.display = 'flex';
+      document.body.style.overflow = 'hidden';
+
+      // Set title
+      const titleEl = document.getElementById('sdt-title');
+      if (titleEl) titleEl.textContent = title || 'Data Table';
+
+      // Show loading
+      showLoading('Loading data…');
+
+      ensureChartJS(() => {
+        fetch(csvUrl)
+          .then(r => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return r.text();
+          })
+          .then(text => {
+            const { headers, rows } = parseCSV(text);
+            _state.rawData      = rows;
+            _state.columns      = detectColumns(headers, rows);
+            _state.filteredData = rows;
+            _state.filters      = {};
+
+            renderStatsStrip();
+            refresh();
+
+            // Wire global search
+            const gs = document.getElementById('sdt-global-search');
+            if (gs) {
+              gs.value = '';
+              gs.oninput = (e) => {
+                _state.globalSearch = e.target.value;
+                refresh();
+              };
+            }
+
+            // Wire virtual scroll
+            const cont = document.getElementById('sdt-table-container');
+            if (cont) {
+              cont.onscroll = () => {
+                _state.scrollTop = cont.scrollTop;
+                const tbody = document.getElementById('sdt-tbody');
+                if (tbody) renderVirtualRows(tbody, cont);
+              };
+            }
+          })
+          .catch(err => {
+            showLoading(`Failed to load data: ${err.message}`);
+          });
+      });
+    },
+
+    close() {
+      const overlay = document.getElementById('sdt-overlay');
+      if (overlay) overlay.style.display = 'none';
+      document.body.style.overflow = '';
+      closeFilterPanel();
+      // Destroy spark charts
+      Object.values(_state.sparkCharts).forEach(c => { try { c.destroy(); } catch {} });
+      _state.sparkCharts = {};
+    },
+
+    /* ── Internal handlers (called from inline onclick) ── */
+
+    _sortBy(colName) {
+      if (_state.sortCol === colName) {
+        _state.sortDir = _state.sortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        _state.sortCol = colName;
+        _state.sortDir = 'asc';
+      }
+      refresh();
+      // Reset scroll to top
+      const cont = document.getElementById('sdt-table-container');
+      if (cont) cont.scrollTop = 0;
+    },
+
+    _openFilterPanel(colName, btnEl) {
+      openFilterPanel(colName, btnEl);
+    },
+
+    _toggleValFilter(colName, val) {
+      if (!_state.filters[colName]) _state.filters[colName] = { selected: [], text: '' };
+      const sel = _state.filters[colName].selected;
+      const idx = sel.indexOf(val);
+      if (idx === -1) sel.push(val);
+      else sel.splice(idx, 1);
+      if (sel.length === 0 && !_state.filters[colName].text) {
+        delete _state.filters[colName];
+      }
+      refresh();
+      // Re-render panel to update checked states
+      const col   = _state.columns.find(c => c.name === colName);
+      const panel = document.getElementById('sdt-filter-panel');
+      if (col && panel && panel.style.display !== 'none') {
+        renderStringFilterPanel(col, panel);
+        // Restore focus on search box
+        const si = document.getElementById('sdt-str-search');
+        if (si) { si.focus(); }
+      }
+    },
+
+    _strSearchChange(colName, val) {
+      if (!_state.filters[colName]) _state.filters[colName] = { selected: [], text: '' };
+      _state.filters[colName].text = val;
+      if (!val && !(_state.filters[colName].selected || []).length) {
+        delete _state.filters[colName];
+      }
+      refresh();
+      // Re-render options in panel
+      const col   = _state.columns.find(c => c.name === colName);
+      const panel = document.getElementById('sdt-filter-panel');
+      if (col && panel && panel.style.display !== 'none') {
+        renderStringFilterPanel(col, panel);
+        const si = document.getElementById('sdt-str-search');
+        if (si) { si.focus(); si.value = val; }
+      }
+    },
+
+    _numFilterChange(colName) {
+      const minEl = document.getElementById('sdt-num-min');
+      const maxEl = document.getElementById('sdt-num-max');
+      if (!_state.filters[colName]) _state.filters[colName] = {};
+      _state.filters[colName].min = minEl ? minEl.value : '';
+      _state.filters[colName].max = maxEl ? maxEl.value : '';
+      if (!_state.filters[colName].min && !_state.filters[colName].max) {
+        delete _state.filters[colName];
+      }
+      refresh();
+    },
+
+    _clearColFilter(colName) {
+      delete _state.filters[colName];
+      refresh();
+      closeFilterPanel();
+    },
+
+    _clearGlobal() {
+      _state.globalSearch = '';
+      const gs = document.getElementById('sdt-global-search');
+      if (gs) gs.value = '';
+      refresh();
+    },
+
+    _resetAll() {
+      _state.filters      = {};
+      _state.globalSearch = '';
+      _state.sortCol      = null;
+      _state.sortDir      = 'asc';
+      const gs = document.getElementById('sdt-global-search');
+      if (gs) gs.value = '';
+      closeFilterPanel();
+      refresh();
+      const cont = document.getElementById('sdt-table-container');
+      if (cont) cont.scrollTop = 0;
+    },
+  };
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     HELPERS
+  ═══════════════════════════════════════════════════════════════════════ */
+  function hasActiveFilter(colName) {
+    const f = _state.filters[colName];
+    if (!f) return false;
+    if (f.selected && f.selected.length > 0) return true;
+    if (f.text) return true;
+    if (f.min !== '' && f.min !== undefined) return true;
+    if (f.max !== '' && f.max !== undefined) return true;
+    return false;
+  }
+
+  function fmt(n) {
+    if (n === undefined || n === null || isNaN(n)) return '—';
+    const num = parseFloat(n);
+    if (Math.abs(num) >= 1e6)  return (num / 1e6).toFixed(2) + 'M';
+    if (Math.abs(num) >= 1e3)  return (num / 1e3).toFixed(1) + 'K';
+    if (Number.isInteger(num)) return num.toLocaleString();
+    return num.toFixed(2);
+  }
+
+  function esc(str) {
+    if (!str) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  // Expose globally
+  global.SarthiDatatable = SarthiDatatable;
+
+})(window);
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Gemini description generation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_llm_client():
-    genai.configure(api_key=GEMINI_API_KEY)
-    return genai.GenerativeModel(GEMINI_MODEL)
 
 
-_TABLE_DESC_PROMPT = """
-You are a senior data analyst documenting a MS SQL Server database for an NL-to-SQL system.
-
-Given the following statistical profile of the table `{table_name}` from database `{db_name}`,
-write a rich, precise description that will help an AI agent:
-1. Understand what real-world entity or process this table represents
-2. Know when to use (or not use) this table for a given user question
-3. Understand the relationships this table has with other tables
-
-Table Profile:
-{profile_json}
-
-Write your response in this EXACT format — no markdown headers, no bullet points outside the specified fields:
-
-TABLE_DESCRIPTION:
-<2-4 sentences. What is this table about? What business entity/process does it represent?
-What kind of questions can be answered using this table? What is the granularity (one row = one what)?
-Mention if the table is a fact table, dimension table, lookup table, or aggregation table.>
-
-RELATIONSHIPS:
-<1-3 sentences. What other tables likely join to this one? On which columns?
-If no obvious relationships, write "Standalone table.">
-
-USAGE_NOTES:
-<1-2 sentences. Any important caveats — e.g. which columns are mostly null and should be avoided,
-which columns store codes vs names, which columns are the primary identifier.>
-"""
-
-_COL_DESC_PROMPT = """
-You are a senior data analyst documenting MS SQL Server columns for an NL-to-SQL system.
-
-Table: `{table_name}` (database: `{db_name}`)
-Table description: {table_description}
-
-Given the following statistical profile of ALL columns in this table,
-write a short precise description for EACH column that tells an AI SQL agent:
-- What real-world concept this column represents
-- Whether it is safe to use (flag AVOID if mostly null / empty)
-- What the typical values look like (mention format if text stores numbers like "5 (10%)")
-
-Column Profiles:
-{columns_json}
-
-Return ONLY a JSON object with this structure — no markdown, no extra text:
-{{
-  "ColumnName1": "Description of column 1.",
-  "ColumnName2": "Description of column 2.",
-  ...
-}}
-
-Rules:
-- For columns with usability=mostly_null or usability=empty: start description with "MOSTLY EMPTY - "
-- For columns that store numeric counts/percentages as text (like "5 (10%)"): mention the format explicitly
-  and say "Extract numeric count using: TRY_CAST(LEFT([ColName], CHARINDEX(' ', [ColName]+' ')-1) AS INT)"
-- Keep each description under 40 words
-- Use the top_values and min/max to infer what the column contains
-- If a column is a foreign key (code matching another table), mention which table it likely links to
-"""
+--------
 
 
-def _generate_table_description(model, table_name: str, profile: dict) -> dict:
-    """Calls Gemini to generate table + column descriptions."""
 
-    # ── Table-level description ────────────────────────────────────────────
-    table_prompt = _TABLE_DESC_PROMPT.format(
-        table_name   = table_name,
-        db_name      = MSSQL_DB_NAME,
-        profile_json = json.dumps({
-            "row_count": profile["row_count"],
-            "columns": {
-                k: {
-                    "data_type":   v["data_type"],
-                    "null_pct":    v["null_pct"],
-                    "usability":   v["usability"],
-                    "unique_count":v["unique_count"],
-                    "top_values":  v["top_values"][:5],
-                    "min_value":   v["min_value"],
-                    "max_value":   v["max_value"],
+SARTHI DATATABLE — INTEGRATION PATCHES FOR sarthi_index.html
+=============================================================
+
+Apply these 3 patches to sarthi_index.html in order.
+Each patch shows the EXACT text to find (FIND:) and what to replace it with (REPLACE WITH:).
+
+═══════════════════════════════════════════════════════════
+PATCH 1 — Add <script> tag for datatable_module.js
+         Place just before the closing </body> tag
+═══════════════════════════════════════════════════════════
+
+FIND (the very last line of the file):
+────────────────────────────────────────
+</body>
+</html>
+────────────────────────────────────────
+
+REPLACE WITH:
+────────────────────────────────────────
+<script src="/static/datatable_module.js"></script>
+</body>
+</html>
+────────────────────────────────────────
+
+NOTE: Put datatable_module.js in your Flask static folder, or serve it via
+      a new Flask route (see Patch 3b below for the Flask route approach).
+
+
+═══════════════════════════════════════════════════════════
+PATCH 2 — Add "View Table" button in the result SSE handler
+          This goes right after the existing CSV download button block
+═══════════════════════════════════════════════════════════
+
+FIND (inside the 'result' case in the switch statement):
+────────────────────────────────────────
+              if (payload.output_csv) {
+              const csvFile = payload.output_csv.split('/').pop();
+              const csvBtn = document.createElement('a');
+              csvBtn.className = 'csv-download-btn';
+              csvBtn.href = `${API_BASE}/download/${encodeURIComponent(csvFile)}`;
+              csvBtn.download = csvFile;
+              csvBtn.innerHTML = `<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
+                <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+              </svg> Download CSV`;
+              resultFooter.appendChild(csvBtn);
+            }
+────────────────────────────────────────
+
+REPLACE WITH:
+────────────────────────────────────────
+              if (payload.output_csv) {
+              const csvFile = payload.output_csv.split('/').pop();
+
+              // ── CSV download button ──────────────────────────────────
+              const csvBtn = document.createElement('a');
+              csvBtn.className = 'csv-download-btn';
+              csvBtn.href = `${API_BASE}/download/${encodeURIComponent(csvFile)}`;
+              csvBtn.download = csvFile;
+              csvBtn.innerHTML = `<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
+                <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+              </svg> Download CSV`;
+              resultFooter.appendChild(csvBtn);
+
+              // ── View Table button ────────────────────────────────────
+              const dtBtn = document.createElement('button');
+              dtBtn.className = 'csv-download-btn';   // reuse same minimal style
+              dtBtn.style.cssText += ';background:var(--lavender-50);color:var(--lavender-600);border-color:var(--lavender-200);cursor:pointer;';
+              dtBtn.innerHTML = `<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
+                <path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>
+              </svg> View Table`;
+              // Store csv url on the button so it can be re-opened any time
+              dtBtn._csvUrl = `${API_BASE}/download/${encodeURIComponent(csvFile)}`;
+              dtBtn._csvTitle = resultData ? (resultData.tables_used || []).join(', ') || csvFile : csvFile;
+              dtBtn.onclick = () => {
+                if (window.SarthiDatatable) {
+                  SarthiDatatable.open(dtBtn._csvUrl, dtBtn._csvTitle);
                 }
-                for k, v in profile["columns"].items()
+              };
+              resultFooter.appendChild(dtBtn);
+
+              // Keep reference so the button is part of the snapshot
+              snapshot._dtBtn = dtBtn;
             }
-        }, indent=2),
-    )
-
-    try:
-        resp = model.generate_content(table_prompt)
-        raw  = resp.text.strip()
-    except Exception as e:
-        logger.error("Gemini table desc failed for %s: %s", table_name, e)
-        raw = ""
-
-    def _extract(key, text):
-        m = re.search(rf"{key}:\s*(.+?)(?=\n[A-Z_]+:|$)", text, re.DOTALL | re.IGNORECASE)
-        return m.group(1).strip() if m else ""
-
-    table_description  = _extract("TABLE_DESCRIPTION", raw)
-    relationships      = _extract("RELATIONSHIPS",      raw)
-    usage_notes        = _extract("USAGE_NOTES",        raw)
-
-    # ── Column-level descriptions ──────────────────────────────────────────
-    col_prompt = _COL_DESC_PROMPT.format(
-        table_name        = table_name,
-        db_name           = MSSQL_DB_NAME,
-        table_description = table_description or f"Table {table_name}",
-        columns_json      = json.dumps({
-            k: {
-                "data_type":      v["data_type"],
-                "null_pct":       v["null_pct"],
-                "usability":      v["usability"],
-                "unique_count":   v["unique_count"],
-                "duplicate_count":v["duplicate_count"],
-                "top_values":     v["top_values"][:10],
-                "min_value":      v["min_value"],
-                "max_value":      v["max_value"],
-            }
-            for k, v in profile["columns"].items()
-        }, indent=2),
-    )
-
-    col_descriptions = {}
-    try:
-        resp2 = model.generate_content(col_prompt)
-        raw2  = resp2.text.strip()
-        raw2  = re.sub(r"^```json\s*", "", raw2, flags=re.IGNORECASE)
-        raw2  = re.sub(r"^```\s*",    "", raw2)
-        raw2  = re.sub(r"```$",       "", raw2).strip()
-        col_descriptions = json.loads(raw2)
-    except Exception as e:
-        logger.error("Gemini col desc failed for %s: %s", table_name, e)
-
-    return {
-        "table_description": table_description,
-        "relationships":     relationships,
-        "usage_notes":       usage_notes,
-        "col_descriptions":  col_descriptions,
-    }
+────────────────────────────────────────
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core enrichment function for one table
-# ─────────────────────────────────────────────────────────────────────────────
+═══════════════════════════════════════════════════════════
+PATCH 3 — No HTML modal needed in index.html
+          The datatable_module.js builds its own modal at runtime.
+          Nothing to add to the HTML body.
+═══════════════════════════════════════════════════════════
 
-def _enrich_table(conn, model, table_name: str) -> dict:
-    """Profile + describe one table. Returns complete metadata dict."""
-    logger.info("  Profiling %s...", table_name)
-    profile = _profile_table(conn, table_name)
-
-    logger.info("  Generating descriptions for %s...", table_name)
-    descriptions = _generate_table_description(model, table_name, profile)
-
-    # ── Merge stats + descriptions per column ──────────────────────────────
-    enriched_columns = {}
-    for col_name, stats in profile["columns"].items():
-        enriched_columns[col_name] = {
-            # Stats
-            "data_type":      stats["data_type"],
-            "is_nullable":    stats["is_nullable"],
-            "total_rows":     stats["total_rows"],
-            "null_count":     stats["null_count"],
-            "not_null_count": stats["not_null_count"],
-            "null_pct":       stats["null_pct"],
-            "unique_count":   stats["unique_count"],
-            "duplicate_count":stats["duplicate_count"],
-            "top_values":     stats["top_values"],
-            "min_value":      stats["min_value"],
-            "max_value":      stats["max_value"],
-            "usability":      stats["usability"],
-            # Description
-            "description": descriptions["col_descriptions"].get(col_name, ""),
-        }
-
-    return {
-        "db_name":           MSSQL_DB_NAME,
-        "table_name":        table_name,
-        "row_count":         profile["row_count"],
-        "table_description": descriptions["table_description"],
-        "relationships":     descriptions["relationships"],
-        "usage_notes":       descriptions["usage_notes"],
-        "enriched_at":       datetime.now().isoformat(),
-        "columns":           enriched_columns,
-    }
+The module injects its own overlay into <body> on first open.
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JSON persistence
-# ─────────────────────────────────────────────────────────────────────────────
+═══════════════════════════════════════════════════════════
+PATCH 3b — Flask route to serve datatable_module.js  (app.py)
+═══════════════════════════════════════════════════════════
 
-def _load_metadata() -> dict:
-    if METADATA_JSON.exists():
-        try:
-            with open(METADATA_JSON, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning("Could not load metadata JSON: %s", e)
-    return {}
+Add this route to app.py (inside create_app, with the other routes):
 
-
-def _save_metadata(meta: dict):
-    with open(METADATA_JSON, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False, default=str)
-    logger.info("Metadata saved → %s", METADATA_JSON)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API — called from app.py
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_enrichment(table_names: list) -> dict:
-    """
-    Main entry point called from app.py at startup.
-
-    Args:
-        table_names: list of MS SQL table names to ensure are enriched
-                     (the PINNED_TABLES list from app.py)
-
-    Returns:
-        Full metadata dict keyed by original table name (not internal DuckDB name).
-        { "TableName": { table_meta... }, ... }
-
-    Behaviour:
-        - Loads existing JSON
-        - Finds tables not yet in JSON (new tables)
-        - Runs profiling + LLM description ONLY on new tables
-        - Saves updated JSON
-        - Returns full metadata for all requested tables
-    """
-    existing = _load_metadata()
-
-    # Normalize keys to lowercase for comparison
-    existing_lower = {k.lower(): k for k in existing.keys()}
-    new_tables     = [t for t in table_names if t.lower() not in existing_lower]
-
-    if not new_tables:
-        logger.info("All %d tables already enriched — loading from cache.", len(table_names))
-        return {t: existing[existing_lower[t.lower()]] for t in table_names
-                if t.lower() in existing_lower}
-
-    logger.info(
-        "%d table(s) need enrichment: %s",
-        len(new_tables), new_tables
-    )
-
-    tunnel = _Tunnel()
-    try:
-        port = tunnel.start()
-        conn = tunnel.get_connection(port)
-        model = _build_llm_client()
-
-        for table_name in new_tables:
-            try:
-                logger.info("Enriching table: %s", table_name)
-                meta = _enrich_table(conn, model, table_name)
-                existing[table_name] = meta
-                # Save after each table so partial progress is not lost
-                _save_metadata(existing)
-                logger.info("  Done: %s (%d rows)", table_name, meta["row_count"])
-            except Exception as e:
-                logger.error("Failed to enrich table '%s': %s", table_name, e)
-
-        conn.close()
-    finally:
-        tunnel.stop()
-
-    # Return only the requested tables
-    existing_lower = {k.lower(): k for k in existing.keys()}
-    return {
-        t: existing[existing_lower[t.lower()]]
-        for t in table_names
-        if t.lower() in existing_lower
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Schema string builder — converts enriched metadata to the text format
-# that schema_info expects (injected into TableMeta.schema_info)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_enriched_schema_info(table_name: str, meta: dict) -> str:
-    """
-    Converts stored metadata dict into a rich schema_info string
-    that replaces the basic one built in _build_schema_info().
-
-    This string is what agents see in their prompts.
-    """
-    lines = []
-    lines.append(f"┌─ Table        : [dbo].[{table_name}]")
-    lines.append(f"│  Database     : {meta.get('db_name', MSSQL_DB_NAME)}")
-    lines.append(f"│  Row count    : {meta.get('row_count', 0):,}")
-    lines.append(f"│")
-    lines.append(f"│  DESCRIPTION  : {meta.get('table_description', '')}")
-    lines.append(f"│  RELATIONSHIPS: {meta.get('relationships', '')}")
-    lines.append(f"│  USAGE NOTES  : {meta.get('usage_notes', '')}")
-    lines.append(f"│")
-    lines.append(f"│  Columns ({len(meta.get('columns', {}))}):")
-
-    for col_name, col in meta.get("columns", {}).items():
-        usability   = col.get("usability", "ok")
-        null_pct    = col.get("null_pct", 0)
-        data_type   = col.get("data_type", "")
-        unique_cnt  = col.get("unique_count", 0)
-        description = col.get("description", "")
-        top_vals    = col.get("top_values", [])
-        min_v       = col.get("min_value")
-        max_v       = col.get("max_value")
-
-        # Usability tag
-        if usability == "empty":
-            tag = "  ⚠ EMPTY - DO NOT USE"
-        elif usability == "mostly_null":
-            tag = f"  ⚠ MOSTLY NULL ({null_pct:.0f}%) - AVOID FOR JOINS/DISPLAY"
-        elif usability == "sparse":
-            tag = f"  ⚠ SPARSE ({null_pct:.0f}% null)"
-        else:
-            tag = ""
-
-        # Sample values summary
-        sample_str = ""
-        if top_vals:
-            samples = [f'"{v["value"]}"' for v in top_vals[:5]]
-            sample_str = f"  -- e.g. {', '.join(samples)}"
-        elif min_v is not None and max_v is not None:
-            sample_str = f"  -- range: {min_v} to {max_v}"
-
-        lines.append(
-            f'    [{col_name}]  {data_type.upper()}  '
-            f'[null:{null_pct:.0f}%  unique:{unique_cnt:,}]{tag}'
-            f'{sample_str}'
+────────────────────────────────────────
+    @app.route("/static/datatable_module.js")
+    def serve_datatable_module():
+        import os
+        module_path = os.path.join(os.path.dirname(__file__), "datatable_module.js")
+        return send_from_directory(
+            directory=os.path.dirname(module_path),
+            path="datatable_module.js",
+            mimetype="application/javascript",
         )
-        if description:
-            lines.append(f'       → {description}')
+────────────────────────────────────────
 
-    lines.append("└─")
-    return "\n".join(lines)
+Place datatable_module.js in the same folder as app.py.
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Standalone runner (python db_metadata_enricher.py)
-# ─────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-    )
+═══════════════════════════════════════════════════════════
+PATCH 4 (optional) — Add hover effect to the View Table button
+         Add this CSS block inside the existing <style> tag,
+         right after the .csv-download-btn rule
+═══════════════════════════════════════════════════════════
 
-    # Example: run on a few tables manually
-    TABLES = [
-        "Ulb",
-        "MaturityLevel_DistrictWisecounts",
-        "MaturityLevel_StateCount",
-        "MaturityLevel_NationalCount",
-        "MaturityLevel_PcwiseCount",
-        "Questions",
-        "Options",
-        "Evidences",
-        "SlpQuestions",
-        "SlpMultiSelectQuestions",
-        "SlpDocuments",
-        "SlpQuestions_Farmer",
-        "Users",
-    ]
+FIND:
+────────────────────────────────────────
+  .csv-download-btn:hover { background: var(--teal-100); }
+────────────────────────────────────────
 
-    result = run_enrichment(TABLES)
-    print(f"\nEnriched {len(result)} tables. Saved to {METADATA_JSON}")
-    for t, meta in result.items():
-        print(f"  {t}: {meta['row_count']:,} rows, "
-              f"{len(meta['columns'])} cols, "
-              f"table_desc={bool(meta['table_description'])}")
+REPLACE WITH:
+────────────────────────────────────────
+  .csv-download-btn:hover { background: var(--teal-100); }
+
+  /* View Table button hover — overrides inline lavender bg */
+  .csv-download-btn[data-dt]:hover,
+  button.csv-download-btn:hover {
+    background: var(--lavender-200) !important;
+    filter: brightness(0.96);
+  }
+────────────────────────────────────────
 
 
+═══════════════════════════════════════════════════════════
+SUMMARY OF FILES
+═══════════════════════════════════════════════════════════
 
+1. datatable_module.js   →  place next to app.py
+2. sarthi_index.html     →  apply Patch 1 + Patch 2 + Patch 4
+3. app.py                →  add Patch 3b Flask route
 
------------------
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# INTEGRATION GUIDE
-# What to change, where, and the exact replacement code
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ───────────────────────────────────────────────────────────────────────────────
-# CHANGE 1 — app.py
-# WHERE: imports section at the top
-# ADD this import after the existing nl_to_sql_main imports:
-# ───────────────────────────────────────────────────────────────────────────────
-
-"""
-from db_metadata_enricher import run_enrichment, build_enriched_schema_info
-"""
-
-# ───────────────────────────────────────────────────────────────────────────────
-# CHANGE 2 — app.py
-# WHERE: inside create_app(), after pipeline = NL2SQLPipeline()
-# REPLACE the existing MS SQL pre-load block with this:
-# ───────────────────────────────────────────────────────────────────────────────
-
-"""
-    # ── Step 1: Run metadata enrichment (one-time per new table) ──────────────
-    mssql_tunnel_configured = all([MSSQL_DB_USER, MSSQL_DB_PASS, MSSQL_DB_NAME,
-                                   SSH_HOST, SSH_PKEY_PATH])
-
-    enriched_metadata = {}   # keyed by original table name e.g. "Ulb"
-
-    if mssql_tunnel_configured and PINNED_TABLES:
-        logger.info("Running metadata enrichment check...")
-        try:
-            # PINNED_TABLES are the original MS SQL table names (exact case)
-            # Map from lowercase internal name → original cased name
-            original_names = [
-                "Ulb", "Users", "Questions", "Options", "Evidences",
-                "SlpQuestions", "SlpMultiSelectQuestions", "SlpDocuments",
-                "MaturityLevel_PcwiseCount", "MaturityLevel_StateCount",
-                "MaturityLevel_NationalCount", "MaturityLevel_DistrictWisecounts",
-                "SlpQuestions_Farmer"
-            ]
-            enriched_metadata = run_enrichment(original_names)
-            logger.info("Metadata enrichment complete — %d tables covered.",
-                        len(enriched_metadata))
-        except Exception as exc:
-            logger.error("Metadata enrichment failed (non-fatal): %s", exc)
-
-    # ── Step 2: Load MS SQL tables into DuckDB (schema only) ──────────────────
-    if mssql_tunnel_configured:
-        logger.info("Loading MS SQL tables via SSH tunnel...")
-        try:
-            tables_to_load = PINNED_TABLES if PINNED_TABLES else None
-            loaded = pipeline.load_mssql_tunnelled_tables(
-                table_names=tables_to_load,
-                enriched_metadata=enriched_metadata,   # ← NEW PARAM
-            )
-            logger.info("Loaded %d table(s): %s", len(loaded), loaded)
-        except Exception as exc:
-            logger.error("Failed to load MS SQL tables: %s", exc)
-    else:
-        logger.info("MS SQL env vars not fully set — skipping.")
-"""
-
-
-# ───────────────────────────────────────────────────────────────────────────────
-# CHANGE 3 — nl_to_sql_main.py
-# WHERE: DataLoader.load_mssql_tunnelled_tables() method signature + body
-# REPLACE the method with this updated version:
-# ───────────────────────────────────────────────────────────────────────────────
-
-"""
-    def load_mssql_tunnelled_tables(
-        self,
-        table_names: Optional[list] = None,
-        enriched_metadata: dict = None,     # ← NEW: keyed by original table name
-    ) -> list:
-        tunnelled_db = TunnelledMSSQL.get_instance()
-        conn         = tunnelled_db.get_connection()
-
-        if not table_names:
-            logger.info("Discovering all tables in '%s'", MSSQL_DB_NAME)
-            table_names = self._list_mssql_tunnelled_tables(conn)
-
-        results = []
-        for t in table_names:
-            try:
-                name = self.load_mssql_tunnelled_table(
-                    t, conn,
-                    enriched_metadata=enriched_metadata,
-                )
-                results.append(name)
-            except Exception as exc:
-                logger.warning("Skipping table '%s': %s", t, exc)
-
-        conn.close()
-        return results
-"""
-
-# ───────────────────────────────────────────────────────────────────────────────
-# CHANGE 4 — nl_to_sql_main.py
-# WHERE: DataLoader.load_mssql_tunnelled_table() method signature + body
-# ADD enriched_metadata parameter and inject schema override at the end:
-# ───────────────────────────────────────────────────────────────────────────────
-
-"""
-    def load_mssql_tunnelled_table(
-        self,
-        original_name: str,
-        conn,
-        enriched_metadata: dict = None,     # ← NEW
-    ) -> str:
-        col_rows, row_count, sample_df = self._build_mssql_schema_info(conn, original_name)
-
-        try:
-            keys = self._fetch_mssql_keys(conn, original_name)
-        except Exception as exc:
-            logger.warning("Could not fetch keys for '%s': %s", original_name, exc)
-            keys = {"primary_keys": [], "foreign_keys": [], "unique_keys": []}
-
-        name = _unique_name(_safe_name(original_name), set(self.tables))
-        self.conn.register(name, sample_df.iloc[0:0])
-
-        # ── Build schema_info ─────────────────────────────────────────────────
-        # If enriched metadata is available for this table, use the rich version.
-        # Otherwise fall back to the basic schema builder.
-        if enriched_metadata and original_name in enriched_metadata:
-            from db_metadata_enricher import build_enriched_schema_info
-            schema_info = build_enriched_schema_info(
-                original_name,
-                enriched_metadata[original_name]
-            )
-            # Still build columns list the normal way for DuckDB registration
-            columns, _ = _build_schema_info(
-                f"[dbo].[{original_name}]",
-                f"mssql_tunnel:{original_name}",
-                MSSQL_DB_NAME,
-                sample_df,
-                keys=keys,
-                include_samples=True,
-            )
-            logger.info("Using enriched schema_info for '%s'", original_name)
-        else:
-            columns, schema_info = _build_schema_info(
-                f"[dbo].[{original_name}]",
-                f"mssql_tunnel:{original_name}",
-                MSSQL_DB_NAME,
-                sample_df,
-                keys=keys,
-                include_samples=True,
-            )
-            # Patch row count (sample_df only has a few rows)
-            schema_info = re.sub(
-                r"│  Row count    : [\d,]+",
-                f"│  Row count    : {row_count:,}",
-                schema_info
-            )
-
-        self.tables[name] = TableMeta(
-            table_name  = name,
-            source      = f"mssql_tunnel:{original_name}",
-            db_name     = MSSQL_DB_NAME,
-            row_count   = row_count,
-            columns     = columns,
-            schema_info = schema_info,
-        )
-        self._mssql_table_map[name] = original_name
-
-        logger.info("Registered '%s' — %d rows, %d FKs",
-                    name, row_count, len(keys["foreign_keys"]))
-        return name
-"""
-
-# ───────────────────────────────────────────────────────────────────────────────
-# CHANGE 5 — nl_to_sql_main.py
-# WHERE: SQLValidatorAgent._execute() method
-# REPLACE the method body with this (adds null-density check):
-# ───────────────────────────────────────────────────────────────────────────────
-
-"""
-    def _execute(self, sql: str, tables_used: list = None):
-        try:
-            if tables_used and self._loader.uses_mssql_tables(tables_used):
-                df = self._loader.execute_on_mssql(sql)
-            else:
-                df = self._loader.execute(sql)
-
-            if df is None or (hasattr(df, 'empty') and df.empty
-                              and len(df.columns) == 0):
-                return False, None, "Query returned no columns — likely a schema mismatch."
-
-            # ── Universal data quality check ─────────────────────────────────
-            if not df.empty and len(df) >= 3:
-                for col in df.columns:
-                    null_pct = df[col].isna().mean()
-                    # Only flag non-numeric columns — numeric NULLs can be valid
-                    if null_pct > 0.7 and df[col].dtype == object:
-                        return False, None, (
-                            f"Data quality FAIL: column '{col}' has "
-                            f"{null_pct:.0%} NULL values in the result. "
-                            f"This means the JOIN condition is wrong OR the source "
-                            f"column is mostly empty in the database. "
-                            f"Check the schema — columns marked [MOSTLY NULL] or "
-                            f"[EMPTY] must not be used for JOINs or display. "
-                            f"Find an alternative table/column that has actual data "
-                            f"for the same information (e.g. state/district names "
-                            f"may exist in a different table)."
-                        )
-
-            return True, df, None
-        except Exception as exc:
-            return False, None, str(exc)
-"""
-
-# ───────────────────────────────────────────────────────────────────────────────
-# CHANGE 6 — nl_to_sql_main.py
-# WHERE: _GENERATOR_SYSTEM prompt constant
-# ADD this block at the end of the system prompt (before the closing triple-quote):
-# ───────────────────────────────────────────────────────────────────────────────
-
-"""
-SCHEMA ANNOTATION RULES (MANDATORY — never ignore these):
-- Columns marked [MOSTLY NULL] or [EMPTY]: NEVER use in SELECT, JOIN, or WHERE.
-  If you need that information, look for it in another table in the schema.
-- Columns marked [SPARSE]: use with caution, always add IS NOT NULL filter.
-- When a column description says "MOSTLY EMPTY": treat as non-existent.
-- When column description mentions format like "5 (10%)" or "N (P%)":
-  Extract integer using: TRY_CAST(LEFT([ColName], CHARINDEX(' ', [ColName]+' ')-1) AS INT)
-  NEVER use plain CAST — use TRY_CAST to handle nulls/empty strings safely.
-- Read USAGE NOTES in each table schema before writing any JOIN or SELECT.
-"""
-
-# ───────────────────────────────────────────────────────────────────────────────
-# CHANGE 7 — nl_to_sql_main.py
-# WHERE: _TABLE_SELECTOR_SYSTEM prompt, under STEP 2 (Resolve Ambiguous Language)
-# ADD this section:
-# ───────────────────────────────────────────────────────────────────────────────
-
-"""
-COLUMN USABILITY RULES (check BEFORE choosing any column):
-- Columns annotated with [MOSTLY NULL], [EMPTY], or whose description starts
-  with "MOSTLY EMPTY": these contain almost no data. NEVER use them for:
-    * JOIN conditions (will silently drop most rows)
-    * SELECT output (will return NULLs)
-    * WHERE filters
-- If you need state/district/category names but the obvious column is marked
-  MOSTLY NULL, scan ALL table schemas for an alternative column with actual data.
-- When you find a workaround (using a different table/column), EXPLICITLY state
-  it in your ENRICHED_QUERY:
-    "NOTE: [TableA].[ColX] is mostly empty — using [TableB].[ColY] instead
-     because it contains the same information with actual data."
-- Prefer joining on numeric code columns (Statecode, Districtcode) over name
-  columns when codes are consistently populated.
-"""
+That's it. No other files change.
+The datatable is fully self-contained — no extra npm, no extra CDN
+(Chart.js is lazy-loaded only if not already present on the page).
