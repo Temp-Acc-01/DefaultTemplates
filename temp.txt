@@ -1,180 +1,110 @@
-@dataclass
-class VizMeta:
-    chart_type:      str
-    title:           str
-    x_axis:          Optional[str] = None
-    x_axis_label:    Optional[str] = None    # ← ADD
-    y_axis:          Optional[str] = None
-    y_axis_label:    Optional[str] = None    # ← ADD
-    y_columns:       list          = field(default_factory=list)
-    secondary_axis:  Optional[str] = None
-    series_label:    Optional[str] = None
-    reasoning:       str           = ""
+def _build_mssql_schema_info(self, conn, original_name: str) -> tuple:
+    cursor = conn.cursor()
+
+    # ── Column info ──────────────────────────────────────────────────
+    cursor.execute(f"""
+        SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_CATALOG = 'FCI'
+        AND TABLE_SCHEMA  = 'dbo'
+        AND TABLE_NAME    = ?
+        ORDER BY ORDINAL_POSITION
+    """, original_name)
+    col_rows = cursor.fetchall()
+
+    # ── Row count ────────────────────────────────────────────────────
+    cursor.execute(f"SELECT COUNT(*) FROM [dbo].[{original_name}]")
+    row_count = cursor.fetchone()[0]
+
+    # ── Per-column: first 10 unique non-null values ──────────────────
+    col_samples = {}
+    for col in col_rows:
+        col_name = col[0]
+        col_type = col[1].lower()
+
+        # Only fetch sample values for text/categorical columns
+        # Numeric and datetime columns don't help the agent understand meaning
+        if col_type not in ('varchar', 'nvarchar', 'char', 'nchar', 'text', 'ntext'):
+            col_samples[col_name] = []
+            continue
+
+        try:
+            cursor.execute(f"""
+                SELECT DISTINCT TOP 10 [{col_name}]
+                FROM [dbo].[{original_name}]
+                WHERE [{col_name}] IS NOT NULL
+                AND LTRIM(RTRIM(CAST([{col_name}] AS NVARCHAR(MAX)))) != ''
+            """)
+            values = [str(row[0]).strip() for row in cursor.fetchall() if row[0] is not None]
+            col_samples[col_name] = values
+        except Exception:
+            col_samples[col_name] = []
+
+    # ── Build sample_df from per-column results ──────────────────────
+    # Pad all columns to same length so DataFrame is valid
+    max_len = max((len(v) for v in col_samples.values()), default=0)
+    max_len = max(max_len, 1)  # at least 1 row
+
+    sample_data = {}
+    for col_name, vals in col_samples.items():
+        padded = vals + [None] * (max_len - len(vals))
+        sample_data[col_name] = padded
+
+    # Add numeric/datetime columns as empty so DataFrame has all columns
+    all_col_names = [c[0] for c in col_rows]
+    for col_name in all_col_names:
+        if col_name not in sample_data:
+            sample_data[col_name] = [None] * max_len
+
+    sample_df = pd.DataFrame(sample_data)
+
+    return col_rows, row_count, sample_df
 
 
 
-----------------
-
-
-CHART_TYPE: <one of: bar, line, pie, scatter, area, heatmap, table>
-TITLE: <concise chart title, max 10 words>
-X_AXIS: <exact column name for primary/category axis. MANDATORY for bar/line/area/scatter.>
-X_AXIS_LABEL: <human-readable label for X axis — strip underscores, humanize abbreviations.
-               Examples: DistrictName→District, OrderDate→Date, ULB_ID→Urban Local Body.
-               For pie: the slice category label. For scatter: horizontal axis label.>
-Y_AXIS: <exact column name for primary value axis. MANDATORY for bar/line/area/scatter.>
-Y_AXIS_LABEL: <ONE collective human-readable label for what Y measures.
-               For multi-series (L0,L1...): derive collective name e.g. "Maturity Level Count".
-               For single series: humanize column name e.g. total_orders→Total Orders.
-               For pie: the numeric value label e.g. Count, Amount.
-               NEVER use raw column names like L0, cnt, amt_sum here.>
-Y_COLUMNS: <comma-separated list of ALL numeric column names to plot as series.
-            For single-series charts: same as Y_AXIS.
-            For multi-series (grouped/stacked bar, multi-line): ALL numeric cols.
-            Example: L0_count,L1_count,L2_count,L3_count,L4_count,L5_count>
-SECONDARY_AXIS: <column name for secondary axis, or NONE>
-SERIES_LABEL: <for multi-series bar: the human-readable label prefix for the series
-               e.g. "Maturity Level" or "Category". NONE for single-series.>
-REASONING: <3-4 sentences explaining chart choice and series mapping.>
-
-
-
--------------
-
-
-
-
-return VizMeta(
-    chart_type     = chosen_type,
-    title          = _parse("TITLE") or question[:60],
-    x_axis         = x_axis,
-    x_axis_label   = _parse("X_AXIS_LABEL") or x_axis,    # ← ADD
-    y_axis         = y_axis,
-    y_axis_label   = _parse("Y_AXIS_LABEL") or y_axis,    # ← ADD
-    y_columns      = y_columns,
-    secondary_axis = _parse("SECONDARY_AXIS"),
-    series_label   = _parse("SERIES_LABEL"),
-    reasoning      = _parse("REASONING") or "",
-)
-
-
-
-
-
-
-
-
-
-
-
-
------------
-
-
-yield sse("viz_meta", {
-    "chart_type":     viz.chart_type,
-    "title":          viz.title,
-    "x_axis":         viz.x_axis,
-    "x_axis_label":   viz.x_axis_label,    # ← ADD
-    "y_axis":         viz.y_axis,
-    "y_axis_label":   viz.y_axis_label,    # ← ADD
-    "y_columns":      viz.y_columns,       # ← ADD (was missing)
-    "secondary_axis": viz.secondary_axis,
-    "series_label":   viz.series_label,
-    "reasoning":      viz.reasoning,
-})
+------------------------
 
 
 
 
------------------------
+if is_valid:
+    rows, cols, data = _df_to_response(result_df)
+    csv_path = None
+    if not result_df.empty:
+        csv_path = str(_output_csv_path(question))
+        result_df.to_csv(csv_path, index=False)
 
+    # ── Agent 3 — Viz metadata ── (must come BEFORE _save_query_result)
+    viz = self._viz_agent.generate(
+        question    = question,
+        sql         = sql,
+        columns     = cols,
+        sample_data = data,
+    )
 
-## Chart Metadata
-Chart Type   : {chart_type}
-Title        : {title}
-X Axis       : {x_axis}
-X Axis Label : {x_axis_label}
-Y Axis       : {y_axis}
-Y Axis Label : {y_axis_label}
-Y Columns    : {y_columns}
-Series Label : {series_label}
+    # ── Now save — viz is defined ──
+    self._save_query_result(
+        question           = question,
+        enriched_query     = enriched_query,
+        sql                = sql,
+        relevant           = relevant,
+        rows               = rows,
+        cols               = cols,
+        data               = data,
+        selector_reasoning = selector_reasoning,
+        viz_meta           = viz,
+        csv_path           = csv_path,
+    )
 
-
-
-
-
--------------------------
-
-
-Before writing code, state:
-- How many rows in the data?
-- How many unique X-axis values?
-- How many unique series/legend items?
-Then apply the label intelligence rules above.
-Use X Axis Label as the axis title on the chart (not the raw X Axis column name).
-Use Y Axis Label as the axis title on the chart (not the raw Y Axis column name).
+    # ── Agent 4 — Plotly chart ──
+    plotly_result = self._plotly.generate(
+        question = question,
+        viz_meta = viz,
+        columns  = cols,
+        data     = data,
+    )
 
 
 
 
 
-
-
-
-------------------
-
-
-
-response = self._chain.invoke({
-    "question":     question,
-    "chart_type":   viz_meta.chart_type,
-    "title":        viz_meta.title,
-    "x_axis":       viz_meta.x_axis       or "None",
-    "x_axis_label": viz_meta.x_axis_label or viz_meta.x_axis or "None",    # ← ADD
-    "y_axis":       viz_meta.y_axis       or "None",
-    "y_axis_label": viz_meta.y_axis_label or viz_meta.y_axis or "None",    # ← ADD
-    "y_columns":    ", ".join(viz_meta.y_columns) if viz_meta.y_columns else (viz_meta.y_axis or "None"),
-    "series_label": viz_meta.series_label or "None",
-    "columns":      ", ".join(columns),
-    "sample_data":  str(data[:10]),
-})
-
-
-
-
-
-
-
-
-
----
-
-
-function buildMetaGrid(tablesUsed, viz) {
-  const wrap = document.createElement('div');
-  wrap.className = 'meta-grid';
-
-  // Use human-readable labels if available, fallback to raw column name
-  const xDisplay = viz.x_axis_label || viz.x_axis || '—';
-  const yDisplay = viz.y_axis_label || viz.y_axis || '—';
-
-  wrap.innerHTML = `
-    <div class="meta-card">
-      <div class="meta-label">Chart type</div>
-      <div class="meta-value"><span class="meta-pill chart">${escHtml(viz.chart_type)}</span></div>
-    </div>
-    <div class="meta-card">
-      <div class="meta-label">Tables used</div>
-      <div class="meta-value">${tablesUsed.map(t => `<span class="meta-pill table-pill">${escHtml(t)}</span>`).join('')}</div>
-    </div>
-    <div class="meta-card">
-      <div class="meta-label">X axis</div>
-      <div class="meta-value">${escHtml(xDisplay)}</div>
-    </div>
-    <div class="meta-card">
-      <div class="meta-label">Y axis</div>
-      <div class="meta-value">${escHtml(yDisplay)}</div>
-    </div>`;
-  return wrap;
-}
