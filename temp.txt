@@ -1,27 +1,100 @@
-# After saving the CSV (find this block in query()):
-csv_path = _output_csv_path(question)
-df.to_csv(csv_path, index=False)
+def _save_query_result(
+    self,
+    question:         str,
+    enriched_query:   str,
+    sql:              str,
+    relevant:         list,
+    rows:             int,
+    cols:             list,
+    data:             list,
+    selector_reasoning: str,
+    viz_meta,
+    csv_path:         str,
+) -> str:
+    """
+    Saves the full query result payload to a JSON file for 
+    debugging and assessment. Returns the json file path.
+    """
+    import json
 
-# ADD THIS — save full result as JSON
-import json
-json_path = str(csv_path).replace(".csv", ".json")
-result_dict = {
-    "question":      question,
-    "enriched_query": enriched_query,
-    "sql":           sql,
-    "tables_used":   relevant,
-    "rows":          rows,
-    "columns":       columns,
-    "reasoning":     selector_reasoning,
-    "visualization": {
-        "chart_type":     viz_meta.chart_type     if viz_meta else None,
-        "x_axis":         viz_meta.x_axis         if viz_meta else None,
-        "y_axis":         viz_meta.y_axis         if viz_meta else None,
-        "y_columns":      viz_meta.y_columns       if viz_meta else [],
-        "secondary_axis": viz_meta.secondary_axis  if viz_meta else None,
-        "title":          viz_meta.title           if viz_meta else None,
-    },
-    "timestamp": datetime.now().isoformat(),
-}
-with open(json_path, "w", encoding="utf-8") as f:
-    json.dump(result_dict, f, indent=2, default=str)
+    if not csv_path:
+        # No CSV means empty result — still save the JSON for debugging
+        slug      = re.sub(r"\W+", "_", question[:40]).strip("_").lower()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_path = str(_ensure_dir(OUTPUT_DIR) / f"{slug}__{timestamp}.json")
+    else:
+        json_path = str(csv_path).replace(".csv", ".json")
+
+    result_dict = {
+        "question":       question,
+        "enriched_query": enriched_query,
+        "sql":            sql,
+        "tables_used":    relevant,
+        "rows":           rows,
+        "columns":        cols,
+        "reasoning":      selector_reasoning,
+        "visualization": {
+            "chart_type":     viz_meta.chart_type     if viz_meta else None,
+            "title":          viz_meta.title           if viz_meta else None,
+            "x_axis":         viz_meta.x_axis          if viz_meta else None,
+            "y_axis":         viz_meta.y_axis          if viz_meta else None,
+            "y_columns":      viz_meta.y_columns        if viz_meta else [],
+            "secondary_axis": viz_meta.secondary_axis   if viz_meta else None,
+            "series_label":   viz_meta.series_label     if viz_meta else None,
+            "reasoning":      viz_meta.reasoning        if viz_meta else None,
+        },
+        "data_sample":  data[:10],   # first 10 rows for debugging
+        "timestamp":    datetime.now().isoformat(),
+    }
+
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(result_dict, f, indent=2, default=str)
+        logger.info("Query result saved → %s", json_path)
+    except Exception as exc:
+        logger.warning("Failed to save query result JSON: %s", exc)
+
+    return json_path
+
+
+---------------
+
+
+# inside query() — in the `if is_valid:` block
+csv_path = None
+if not result_df.empty:
+    csv_path = str(_output_csv_path(question))
+    result_df.to_csv(csv_path, index=False)
+
+# ✅ Add this right after CSV save
+self._save_query_result(
+    question          = question,
+    enriched_query    = enriched_query,
+    sql               = sql,
+    relevant          = relevant,
+    rows              = rows,
+    cols              = cols,
+    data              = data,
+    selector_reasoning= selector_reasoning,
+    viz_meta          = viz,
+    csv_path          = csv_path,
+)
+
+
+
+---------------
+
+
+# inside stream_query() — right after result_df.to_csv(...)
+self._save_query_result(
+    question          = question,
+    enriched_query    = enriched_query,
+    sql               = sql,
+    relevant          = relevant,
+    rows              = rows,
+    cols              = cols,
+    data              = data,
+    selector_reasoning= selector_reasoning,
+    viz_meta          = viz,         # viz is defined just below — move this call after viz is generated
+    csv_path          = csv_path,
+)
