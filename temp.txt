@@ -1,126 +1,868 @@
-_TABLE_SELECTOR_SYSTEM = """
-You are a senior data analyst and SQL architect with 15+ years of experience.
-Your job is to deeply understand what a user truly wants, select the minimum
-correct set of tables, and produce a precise enriched query specification that
-a SQL engineer can directly convert to code.
+"""
+db_metadata_enricher.py
+========================
+One-time metadata generation module for MS SQL Server tables via SSH tunnel.
 
-Each table entry shows:
-  INTERNAL_NAME | display: [dbo].[ActualName] | (N rows) | columns: col1, col2, ...
+For each table + column it computes:
+  - Total rows
+  - Per-column: null count, not-null count, unique count, duplicate count,
+    null %, top 10 distinct values (text cols only), min/max (numeric/date cols)
+  - LLM-generated descriptions: table-level and column-level using Gemini 2.5 Pro
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 1 — UNDERSTAND THE INTENT DEEPLY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Before touching any table or column, answer these internally:
+Results stored in a single JSON file with hierarchy:
+  db_name -> table_name -> { table_meta, columns: { col_name -> col_meta } }
 
-A. What is the user's PRIMARY goal?
-   - Are they ranking? (TOP N, BOTTOM N, best, worst, highest, lowest)
-   - Are they aggregating? (total, sum, count, average, distribution)
-   - Are they filtering? (specific value, date range, category)
-   - Are they comparing? (vs, between groups, trend over time)
-   - Are they listing? (show all, get details of)
-   - Are they doing something composite? (top AND bottom, filter AND rank)
+On Flask app restart:
+  - Loads existing JSON
+  - Detects newly added tables not yet covered
+  - Runs enrichment only on new tables
+  - Merges and saves back
 
-B. What is the ENTITY they care about?
-   - What real-world thing are they asking about? (district, user, question, compliance score)
-   - Which table's primary key or main column represents that entity?
+Integration points (see bottom of file for instructions):
+  - Called from app.py at startup BEFORE loading schema
+  - Enriched descriptions injected into TableMeta.schema_info
+  - Fed to Agent 0 (table selection) and Agent 1 (SQL generation)
+"""
 
-C. What is the MEASURE or METRIC?
-   - What are they counting, summing, or scoring?
-   - Is it a raw count, a percentage, an average, a ratio?
-   - Which exact column name from the schema maps to this measure?
+import os
+import re
+import json
+import logging
+import pyodbc
+import paramiko
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
 
-D. What is the DIMENSION or BREAKDOWN?
-   - How should results be grouped or segmented? (by state, by district, by category)
-   - Which column drives the GROUP BY?
+from sshtunnel import SSHTunnelForwarder
+from dotenv import load_dotenv
+import google.generativeai as genai
 
-E. What are the FILTERS or CONDITIONS?
-   - Are there time constraints? (last month, this year, specific date)
-   - Are there category filters? (specific status, type, region)
-   - Are there value thresholds? (above X, below Y, equal to Z)
-   - Map each filter to an exact column and value from the schema.
+load_dotenv()
 
-F. Is there RANKING or LIMITING?
-   - Does the user want TOP N or BOTTOM N? Extract the exact N.
-   - If not specified, default to TOP 10.
-   - For "top AND bottom" queries: plan TWO ranked subqueries UNION-ed.
+logger = logging.getLogger(__name__)
 
-G. Are there JOINS required?
-   - Does answering the question require data from more than one table?
-   - Identify the FK relationship that links them.
-   - Only join if the needed column genuinely doesn't exist in a single table.
+# ─────────────────────────────────────────────────────────────────────────────
+# Config — reads from same env vars as nl_to_sql_main.py
+# ─────────────────────────────────────────────────────────────────────────────
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL    = "gemini-2.5-pro"
 
-H. What DATA TYPE considerations apply?
-   - Are you counting rows (COUNT(*)) or summing a numeric column (SUM)?
-   - Are date columns stored as varchar or datetime? (affects filtering)
-   - Are categorical values stored as codes or labels? (map code→meaning)
+SSH_HOST        = os.environ.get("SSH_HOST",      "3.108.55.154")
+SSH_USER        = os.environ.get("SSH_USER",      "ubuntu")
+SSH_PKEY_PATH   = os.environ.get("SSH_PKEY_PATH", "/home/shared/gaurav/dashboard_v2/module/pcsap-DB.pem")
+MSSQL_DB_HOST   = os.environ.get("MSSQL_DB_HOST", "16.0.2.77")
+MSSQL_DB_USER   = os.environ.get("MSSQL_DB_USER", "pcsap@readonly")
+MSSQL_DB_PASS   = os.environ.get("MSSQL_DB_PASS", "pcsap@123")
+MSSQL_DB_NAME   = os.environ.get("MSSQL_DB_NAME", "FCI")
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 2 — RESOLVE AMBIGUOUS LANGUAGE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Map every vague or business term in the user's question to concrete schema elements:
+METADATA_JSON   = Path(os.environ.get("METADATA_JSON", "db_metadata.json"))
 
-- "top / best / highest / most"    → ORDER BY [measure_col] DESC, TOP N
-- "bottom / worst / lowest / least"→ ORDER BY [measure_col] ASC, TOP N
-- "compliance / score / level"     → identify the exact column storing this
-- "recent / latest / last month"   → date column with DATEADD/GETDATE() filter
-- "district / state / zone / area" → identify the exact geographic column name
-- "performance / achievement"      → identify what numeric column measures this
-- "distribution / breakdown"       → GROUP BY the dimension column
-- "trend / over time"              → GROUP BY date/period column, ORDER BY date
-- "compare X vs Y"                 → two groups in WHERE or CASE WHEN
-- "each / per / by [dimension]"    → GROUP BY that dimension
-- "unique / distinct"              → COUNT(DISTINCT col)
-- "all / every"                    → no TOP limit, no WHERE filter
-- "active / inactive / pending"    → find the status column and its exact value
+# ─────────────────────────────────────────────────────────────────────────────
+# SSH Tunnel helper (standalone, does not depend on nl_to_sql_main)
+# ─────────────────────────────────────────────────────────────────────────────
+class _Tunnel:
+    def __init__(self):
+        self._tunnel = None
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 3 — SELECT TABLES (minimum necessary)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Selection rules (apply in order, stop at first match):
-1. If ONE table contains ALL needed columns → use only that table.
-2. If a JOIN is needed → use exactly the tables required, no extras.
-3. If multiple tables could work → prefer the one whose name/columns
-   most closely match the user's wording. Commit — do not alternate.
-4. NEVER include a table "just in case" — only if directly needed.
-5. Use ONLY the INTERNAL_NAME (before the | symbol) in your response.
+    def start(self):
+        pkey = paramiko.RSAKey.from_private_key_file(SSH_PKEY_PATH)
+        self._tunnel = SSHTunnelForwarder(
+            (SSH_HOST, 22),
+            ssh_username=SSH_USER,
+            ssh_pkey=pkey,
+            remote_bind_address=(MSSQL_DB_HOST, 1433),
+            set_keepalive=60,
+        )
+        self._tunnel.start()
+        logger.info("Enricher tunnel on port %d", self._tunnel.local_bind_port)
+        return self._tunnel.local_bind_port
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 4 — BUILD THE ENRICHED QUERY SPECIFICATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Write a precise, complete natural language specification that a SQL engineer
-can convert directly to code — NO SQL syntax, but every detail spelled out.
+    def stop(self):
+        if self._tunnel:
+            self._tunnel.stop()
 
-Your enriched query MUST explicitly state:
-  ✦ The exact table(s) to query (use natural names, not bracket format)
-  ✦ The exact column names for SELECT
-  ✦ The aggregation function and alias (e.g. COUNT(*) AS total_ulbs)
-  ✦ The GROUP BY column(s)
-  ✦ The ORDER BY column and direction (ASC or DESC)
-  ✦ The row limit (TOP N — state the exact number)
-  ✦ Any WHERE filters with exact column names and values
-  ✦ Any JOIN paths with the FK column linking the tables
-  ✦ Any HAVING conditions if filtering on aggregated values
-  ✦ For UNION queries (top + bottom): describe each part separately
+    def get_connection(self, port: int):
+        conn_str = (
+            "DRIVER={ODBC Driver 18 for SQL Server};"
+            f"SERVER=127.0.0.1,{port};"
+            f"DATABASE={MSSQL_DB_NAME};"
+            f"UID={MSSQL_DB_USER};"
+            f"PWD={MSSQL_DB_PASS};"
+            "Encrypt=yes;TrustServerCertificate=yes;Connection Timeout=30;"
+        )
+        return pyodbc.connect(conn_str)
 
-Quality checklist before writing — a senior analyst would verify:
-  □ Have I identified the single most relevant measure column?
-  □ Have I chosen the most specific geographic/dimension column available?
-  □ Have I mapped any coded values (e.g. status=2 means "Pending") correctly?
-  □ Is the sort direction right? (highest=DESC, lowest=ASC)
-  □ If user said "each state" — is GROUP BY on the state column, not district?
-  □ If user said "top 5 and bottom 5" — are there TWO ranked sets?
-  □ Does my spec produce EXACTLY what the user asked for — not more, not less?
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT FORMAT — return ONLY this, nothing else:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ─────────────────────────────────────────────────────────────────────────────
+# Statistical profiling — pure SQL, no pandas
+# ─────────────────────────────────────────────────────────────────────────────
 
-TABLES: internal_name1,internal_name2
-REASONING: <2-3 sentences: which tables chosen, why, and what FK links them if joined>
-ENRICHED_QUERY: 
-  Your full natural language specification — as many sentences as needed.
-  Be explicit about every column name, aggregation, filter, sort, and limit.
-  Do NOT use bracket [dbo].[Table] format here.
-  Do NOT write SQL — write precise English that maps 1:1 to SQL operations.
->
+def _profile_table(conn, table_name: str) -> dict:
+    """
+    Runs statistical SQL queries against one MS SQL table.
+    Returns a dict with row_count and per-column stats.
+    """
+    cursor = conn.cursor()
+
+    # ── Row count ─────────────────────────────────────────────────────────
+    cursor.execute(f"SELECT COUNT(*) FROM [dbo].[{table_name}]")
+    row_count = cursor.fetchone()[0]
+
+    # ── Column info ───────────────────────────────────────────────────────
+    cursor.execute("""
+        SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
+               IS_NULLABLE, ORDINAL_POSITION
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_CATALOG = ? AND TABLE_SCHEMA = 'dbo' AND TABLE_NAME = ?
+        ORDER BY ORDINAL_POSITION
+    """, MSSQL_DB_NAME, table_name)
+    col_info = cursor.fetchall()
+
+    columns = {}
+
+    for col in col_info:
+        col_name   = col[0]
+        data_type  = col[1].lower()
+        is_nullable= col[3]
+
+        col_stats = {
+            "data_type":    data_type,
+            "is_nullable":  is_nullable,
+            "total_rows":   row_count,
+            "null_count":   0,
+            "not_null_count": 0,
+            "null_pct":     0.0,
+            "unique_count": 0,
+            "duplicate_count": 0,
+            "top_values":   [],
+            "min_value":    None,
+            "max_value":    None,
+            "usability":    "ok",   # ok | sparse | mostly_null | empty
+        }
+
+        if row_count == 0:
+            columns[col_name] = col_stats
+            continue
+
+        # ── Null / not-null counts ─────────────────────────────────────
+        try:
+            cursor.execute(f"""
+                SELECT
+                    SUM(CASE WHEN [{col_name}] IS NULL THEN 1 ELSE 0 END),
+                    COUNT([{col_name}])
+                FROM [dbo].[{table_name}]
+            """)
+            r = cursor.fetchone()
+            null_count     = r[0] or 0
+            not_null_count = r[1] or 0
+            null_pct       = round(null_count / row_count * 100, 2) if row_count else 0
+
+            col_stats["null_count"]     = null_count
+            col_stats["not_null_count"] = not_null_count
+            col_stats["null_pct"]       = null_pct
+
+            # Usability flag
+            if null_pct == 100:
+                col_stats["usability"] = "empty"
+            elif null_pct >= 80:
+                col_stats["usability"] = "mostly_null"
+            elif null_pct >= 40:
+                col_stats["usability"] = "sparse"
+            else:
+                col_stats["usability"] = "ok"
+
+        except Exception as e:
+            logger.warning("Null count failed for %s.%s: %s", table_name, col_name, e)
+
+        # ── Unique / duplicate counts ──────────────────────────────────
+        try:
+            cursor.execute(f"""
+                SELECT COUNT(DISTINCT [{col_name}])
+                FROM [dbo].[{table_name}]
+                WHERE [{col_name}] IS NOT NULL
+            """)
+            unique_count = cursor.fetchone()[0] or 0
+            col_stats["unique_count"]    = unique_count
+            col_stats["duplicate_count"] = max(0, not_null_count - unique_count)
+        except Exception as e:
+            logger.warning("Unique count failed for %s.%s: %s", table_name, col_name, e)
+
+        # ── Top 10 distinct values (text / categorical columns) ────────
+        text_types = {"varchar", "nvarchar", "char", "nchar", "text", "ntext"}
+        if data_type in text_types and col_stats["usability"] in ("ok", "sparse"):
+            try:
+                cursor.execute(f"""
+                    SELECT TOP 10 [{col_name}], COUNT(*) AS freq
+                    FROM [dbo].[{table_name}]
+                    WHERE [{col_name}] IS NOT NULL
+                      AND LTRIM(RTRIM(CAST([{col_name}] AS NVARCHAR(MAX)))) != ''
+                    GROUP BY [{col_name}]
+                    ORDER BY freq DESC
+                """)
+                rows = cursor.fetchall()
+                col_stats["top_values"] = [
+                    {"value": str(r[0]).strip(), "count": r[1]}
+                    for r in rows
+                ]
+            except Exception as e:
+                logger.warning("Top values failed for %s.%s: %s", table_name, col_name, e)
+
+        # ── Min / Max (numeric + date cols) ───────────────────────────
+        numeric_types = {"int", "bigint", "smallint", "tinyint", "decimal",
+                         "numeric", "float", "real", "money", "smallmoney"}
+        date_types    = {"date", "datetime", "datetime2", "smalldatetime", "datetimeoffset"}
+
+        if data_type in numeric_types | date_types and col_stats["usability"] in ("ok", "sparse"):
+            try:
+                cursor.execute(f"""
+                    SELECT MIN([{col_name}]), MAX([{col_name}])
+                    FROM [dbo].[{table_name}]
+                    WHERE [{col_name}] IS NOT NULL
+                """)
+                r = cursor.fetchone()
+                col_stats["min_value"] = str(r[0]) if r[0] is not None else None
+                col_stats["max_value"] = str(r[1]) if r[1] is not None else None
+            except Exception as e:
+                logger.warning("Min/max failed for %s.%s: %s", table_name, col_name, e)
+
+        columns[col_name] = col_stats
+
+    return {"row_count": row_count, "columns": columns}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini description generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_llm_client():
+    genai.configure(api_key=GEMINI_API_KEY)
+    return genai.GenerativeModel(GEMINI_MODEL)
+
+
+_TABLE_DESC_PROMPT = """
+You are a senior data analyst documenting a MS SQL Server database for an NL-to-SQL system.
+
+Given the following statistical profile of the table `{table_name}` from database `{db_name}`,
+write a rich, precise description that will help an AI agent:
+1. Understand what real-world entity or process this table represents
+2. Know when to use (or not use) this table for a given user question
+3. Understand the relationships this table has with other tables
+
+Table Profile:
+{profile_json}
+
+Write your response in this EXACT format — no markdown headers, no bullet points outside the specified fields:
+
+TABLE_DESCRIPTION:
+<2-4 sentences. What is this table about? What business entity/process does it represent?
+What kind of questions can be answered using this table? What is the granularity (one row = one what)?
+Mention if the table is a fact table, dimension table, lookup table, or aggregation table.>
+
+RELATIONSHIPS:
+<1-3 sentences. What other tables likely join to this one? On which columns?
+If no obvious relationships, write "Standalone table.">
+
+USAGE_NOTES:
+<1-2 sentences. Any important caveats — e.g. which columns are mostly null and should be avoided,
+which columns store codes vs names, which columns are the primary identifier.>
+"""
+
+_COL_DESC_PROMPT = """
+You are a senior data analyst documenting MS SQL Server columns for an NL-to-SQL system.
+
+Table: `{table_name}` (database: `{db_name}`)
+Table description: {table_description}
+
+Given the following statistical profile of ALL columns in this table,
+write a short precise description for EACH column that tells an AI SQL agent:
+- What real-world concept this column represents
+- Whether it is safe to use (flag AVOID if mostly null / empty)
+- What the typical values look like (mention format if text stores numbers like "5 (10%)")
+
+Column Profiles:
+{columns_json}
+
+Return ONLY a JSON object with this structure — no markdown, no extra text:
+{{
+  "ColumnName1": "Description of column 1.",
+  "ColumnName2": "Description of column 2.",
+  ...
+}}
+
+Rules:
+- For columns with usability=mostly_null or usability=empty: start description with "MOSTLY EMPTY - "
+- For columns that store numeric counts/percentages as text (like "5 (10%)"): mention the format explicitly
+  and say "Extract numeric count using: TRY_CAST(LEFT([ColName], CHARINDEX(' ', [ColName]+' ')-1) AS INT)"
+- Keep each description under 40 words
+- Use the top_values and min/max to infer what the column contains
+- If a column is a foreign key (code matching another table), mention which table it likely links to
+"""
+
+
+def _generate_table_description(model, table_name: str, profile: dict) -> dict:
+    """Calls Gemini to generate table + column descriptions."""
+
+    # ── Table-level description ────────────────────────────────────────────
+    table_prompt = _TABLE_DESC_PROMPT.format(
+        table_name   = table_name,
+        db_name      = MSSQL_DB_NAME,
+        profile_json = json.dumps({
+            "row_count": profile["row_count"],
+            "columns": {
+                k: {
+                    "data_type":   v["data_type"],
+                    "null_pct":    v["null_pct"],
+                    "usability":   v["usability"],
+                    "unique_count":v["unique_count"],
+                    "top_values":  v["top_values"][:5],
+                    "min_value":   v["min_value"],
+                    "max_value":   v["max_value"],
+                }
+                for k, v in profile["columns"].items()
+            }
+        }, indent=2),
+    )
+
+    try:
+        resp = model.generate_content(table_prompt)
+        raw  = resp.text.strip()
+    except Exception as e:
+        logger.error("Gemini table desc failed for %s: %s", table_name, e)
+        raw = ""
+
+    def _extract(key, text):
+        m = re.search(rf"{key}:\s*(.+?)(?=\n[A-Z_]+:|$)", text, re.DOTALL | re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    table_description  = _extract("TABLE_DESCRIPTION", raw)
+    relationships      = _extract("RELATIONSHIPS",      raw)
+    usage_notes        = _extract("USAGE_NOTES",        raw)
+
+    # ── Column-level descriptions ──────────────────────────────────────────
+    col_prompt = _COL_DESC_PROMPT.format(
+        table_name        = table_name,
+        db_name           = MSSQL_DB_NAME,
+        table_description = table_description or f"Table {table_name}",
+        columns_json      = json.dumps({
+            k: {
+                "data_type":      v["data_type"],
+                "null_pct":       v["null_pct"],
+                "usability":      v["usability"],
+                "unique_count":   v["unique_count"],
+                "duplicate_count":v["duplicate_count"],
+                "top_values":     v["top_values"][:10],
+                "min_value":      v["min_value"],
+                "max_value":      v["max_value"],
+            }
+            for k, v in profile["columns"].items()
+        }, indent=2),
+    )
+
+    col_descriptions = {}
+    try:
+        resp2 = model.generate_content(col_prompt)
+        raw2  = resp2.text.strip()
+        raw2  = re.sub(r"^```json\s*", "", raw2, flags=re.IGNORECASE)
+        raw2  = re.sub(r"^```\s*",    "", raw2)
+        raw2  = re.sub(r"```$",       "", raw2).strip()
+        col_descriptions = json.loads(raw2)
+    except Exception as e:
+        logger.error("Gemini col desc failed for %s: %s", table_name, e)
+
+    return {
+        "table_description": table_description,
+        "relationships":     relationships,
+        "usage_notes":       usage_notes,
+        "col_descriptions":  col_descriptions,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core enrichment function for one table
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _enrich_table(conn, model, table_name: str) -> dict:
+    """Profile + describe one table. Returns complete metadata dict."""
+    logger.info("  Profiling %s...", table_name)
+    profile = _profile_table(conn, table_name)
+
+    logger.info("  Generating descriptions for %s...", table_name)
+    descriptions = _generate_table_description(model, table_name, profile)
+
+    # ── Merge stats + descriptions per column ──────────────────────────────
+    enriched_columns = {}
+    for col_name, stats in profile["columns"].items():
+        enriched_columns[col_name] = {
+            # Stats
+            "data_type":      stats["data_type"],
+            "is_nullable":    stats["is_nullable"],
+            "total_rows":     stats["total_rows"],
+            "null_count":     stats["null_count"],
+            "not_null_count": stats["not_null_count"],
+            "null_pct":       stats["null_pct"],
+            "unique_count":   stats["unique_count"],
+            "duplicate_count":stats["duplicate_count"],
+            "top_values":     stats["top_values"],
+            "min_value":      stats["min_value"],
+            "max_value":      stats["max_value"],
+            "usability":      stats["usability"],
+            # Description
+            "description": descriptions["col_descriptions"].get(col_name, ""),
+        }
+
+    return {
+        "db_name":           MSSQL_DB_NAME,
+        "table_name":        table_name,
+        "row_count":         profile["row_count"],
+        "table_description": descriptions["table_description"],
+        "relationships":     descriptions["relationships"],
+        "usage_notes":       descriptions["usage_notes"],
+        "enriched_at":       datetime.now().isoformat(),
+        "columns":           enriched_columns,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_metadata() -> dict:
+    if METADATA_JSON.exists():
+        try:
+            with open(METADATA_JSON, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning("Could not load metadata JSON: %s", e)
+    return {}
+
+
+def _save_metadata(meta: dict):
+    with open(METADATA_JSON, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False, default=str)
+    logger.info("Metadata saved → %s", METADATA_JSON)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API — called from app.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_enrichment(table_names: list) -> dict:
+    """
+    Main entry point called from app.py at startup.
+
+    Args:
+        table_names: list of MS SQL table names to ensure are enriched
+                     (the PINNED_TABLES list from app.py)
+
+    Returns:
+        Full metadata dict keyed by original table name (not internal DuckDB name).
+        { "TableName": { table_meta... }, ... }
+
+    Behaviour:
+        - Loads existing JSON
+        - Finds tables not yet in JSON (new tables)
+        - Runs profiling + LLM description ONLY on new tables
+        - Saves updated JSON
+        - Returns full metadata for all requested tables
+    """
+    existing = _load_metadata()
+
+    # Normalize keys to lowercase for comparison
+    existing_lower = {k.lower(): k for k in existing.keys()}
+    new_tables     = [t for t in table_names if t.lower() not in existing_lower]
+
+    if not new_tables:
+        logger.info("All %d tables already enriched — loading from cache.", len(table_names))
+        return {t: existing[existing_lower[t.lower()]] for t in table_names
+                if t.lower() in existing_lower}
+
+    logger.info(
+        "%d table(s) need enrichment: %s",
+        len(new_tables), new_tables
+    )
+
+    tunnel = _Tunnel()
+    try:
+        port = tunnel.start()
+        conn = tunnel.get_connection(port)
+        model = _build_llm_client()
+
+        for table_name in new_tables:
+            try:
+                logger.info("Enriching table: %s", table_name)
+                meta = _enrich_table(conn, model, table_name)
+                existing[table_name] = meta
+                # Save after each table so partial progress is not lost
+                _save_metadata(existing)
+                logger.info("  Done: %s (%d rows)", table_name, meta["row_count"])
+            except Exception as e:
+                logger.error("Failed to enrich table '%s': %s", table_name, e)
+
+        conn.close()
+    finally:
+        tunnel.stop()
+
+    # Return only the requested tables
+    existing_lower = {k.lower(): k for k in existing.keys()}
+    return {
+        t: existing[existing_lower[t.lower()]]
+        for t in table_names
+        if t.lower() in existing_lower
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schema string builder — converts enriched metadata to the text format
+# that schema_info expects (injected into TableMeta.schema_info)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_enriched_schema_info(table_name: str, meta: dict) -> str:
+    """
+    Converts stored metadata dict into a rich schema_info string
+    that replaces the basic one built in _build_schema_info().
+
+    This string is what agents see in their prompts.
+    """
+    lines = []
+    lines.append(f"┌─ Table        : [dbo].[{table_name}]")
+    lines.append(f"│  Database     : {meta.get('db_name', MSSQL_DB_NAME)}")
+    lines.append(f"│  Row count    : {meta.get('row_count', 0):,}")
+    lines.append(f"│")
+    lines.append(f"│  DESCRIPTION  : {meta.get('table_description', '')}")
+    lines.append(f"│  RELATIONSHIPS: {meta.get('relationships', '')}")
+    lines.append(f"│  USAGE NOTES  : {meta.get('usage_notes', '')}")
+    lines.append(f"│")
+    lines.append(f"│  Columns ({len(meta.get('columns', {}))}):")
+
+    for col_name, col in meta.get("columns", {}).items():
+        usability   = col.get("usability", "ok")
+        null_pct    = col.get("null_pct", 0)
+        data_type   = col.get("data_type", "")
+        unique_cnt  = col.get("unique_count", 0)
+        description = col.get("description", "")
+        top_vals    = col.get("top_values", [])
+        min_v       = col.get("min_value")
+        max_v       = col.get("max_value")
+
+        # Usability tag
+        if usability == "empty":
+            tag = "  ⚠ EMPTY - DO NOT USE"
+        elif usability == "mostly_null":
+            tag = f"  ⚠ MOSTLY NULL ({null_pct:.0f}%) - AVOID FOR JOINS/DISPLAY"
+        elif usability == "sparse":
+            tag = f"  ⚠ SPARSE ({null_pct:.0f}% null)"
+        else:
+            tag = ""
+
+        # Sample values summary
+        sample_str = ""
+        if top_vals:
+            samples = [f'"{v["value"]}"' for v in top_vals[:5]]
+            sample_str = f"  -- e.g. {', '.join(samples)}"
+        elif min_v is not None and max_v is not None:
+            sample_str = f"  -- range: {min_v} to {max_v}"
+
+        lines.append(
+            f'    [{col_name}]  {data_type.upper()}  '
+            f'[null:{null_pct:.0f}%  unique:{unique_cnt:,}]{tag}'
+            f'{sample_str}'
+        )
+        if description:
+            lines.append(f'       → {description}')
+
+    lines.append("└─")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone runner (python db_metadata_enricher.py)
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    )
+
+    # Example: run on a few tables manually
+    TABLES = [
+        "Ulb",
+        "MaturityLevel_DistrictWisecounts",
+        "MaturityLevel_StateCount",
+        "MaturityLevel_NationalCount",
+        "MaturityLevel_PcwiseCount",
+        "Questions",
+        "Options",
+        "Evidences",
+        "SlpQuestions",
+        "SlpMultiSelectQuestions",
+        "SlpDocuments",
+        "SlpQuestions_Farmer",
+        "Users",
+    ]
+
+    result = run_enrichment(TABLES)
+    print(f"\nEnriched {len(result)} tables. Saved to {METADATA_JSON}")
+    for t, meta in result.items():
+        print(f"  {t}: {meta['row_count']:,} rows, "
+              f"{len(meta['columns'])} cols, "
+              f"table_desc={bool(meta['table_description'])}")
+
+
+
+
+-----------------
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INTEGRATION GUIDE
+# What to change, where, and the exact replacement code
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CHANGE 1 — app.py
+# WHERE: imports section at the top
+# ADD this import after the existing nl_to_sql_main imports:
+# ───────────────────────────────────────────────────────────────────────────────
+
+"""
+from db_metadata_enricher import run_enrichment, build_enriched_schema_info
+"""
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CHANGE 2 — app.py
+# WHERE: inside create_app(), after pipeline = NL2SQLPipeline()
+# REPLACE the existing MS SQL pre-load block with this:
+# ───────────────────────────────────────────────────────────────────────────────
+
+"""
+    # ── Step 1: Run metadata enrichment (one-time per new table) ──────────────
+    mssql_tunnel_configured = all([MSSQL_DB_USER, MSSQL_DB_PASS, MSSQL_DB_NAME,
+                                   SSH_HOST, SSH_PKEY_PATH])
+
+    enriched_metadata = {}   # keyed by original table name e.g. "Ulb"
+
+    if mssql_tunnel_configured and PINNED_TABLES:
+        logger.info("Running metadata enrichment check...")
+        try:
+            # PINNED_TABLES are the original MS SQL table names (exact case)
+            # Map from lowercase internal name → original cased name
+            original_names = [
+                "Ulb", "Users", "Questions", "Options", "Evidences",
+                "SlpQuestions", "SlpMultiSelectQuestions", "SlpDocuments",
+                "MaturityLevel_PcwiseCount", "MaturityLevel_StateCount",
+                "MaturityLevel_NationalCount", "MaturityLevel_DistrictWisecounts",
+                "SlpQuestions_Farmer"
+            ]
+            enriched_metadata = run_enrichment(original_names)
+            logger.info("Metadata enrichment complete — %d tables covered.",
+                        len(enriched_metadata))
+        except Exception as exc:
+            logger.error("Metadata enrichment failed (non-fatal): %s", exc)
+
+    # ── Step 2: Load MS SQL tables into DuckDB (schema only) ──────────────────
+    if mssql_tunnel_configured:
+        logger.info("Loading MS SQL tables via SSH tunnel...")
+        try:
+            tables_to_load = PINNED_TABLES if PINNED_TABLES else None
+            loaded = pipeline.load_mssql_tunnelled_tables(
+                table_names=tables_to_load,
+                enriched_metadata=enriched_metadata,   # ← NEW PARAM
+            )
+            logger.info("Loaded %d table(s): %s", len(loaded), loaded)
+        except Exception as exc:
+            logger.error("Failed to load MS SQL tables: %s", exc)
+    else:
+        logger.info("MS SQL env vars not fully set — skipping.")
+"""
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CHANGE 3 — nl_to_sql_main.py
+# WHERE: DataLoader.load_mssql_tunnelled_tables() method signature + body
+# REPLACE the method with this updated version:
+# ───────────────────────────────────────────────────────────────────────────────
+
+"""
+    def load_mssql_tunnelled_tables(
+        self,
+        table_names: Optional[list] = None,
+        enriched_metadata: dict = None,     # ← NEW: keyed by original table name
+    ) -> list:
+        tunnelled_db = TunnelledMSSQL.get_instance()
+        conn         = tunnelled_db.get_connection()
+
+        if not table_names:
+            logger.info("Discovering all tables in '%s'", MSSQL_DB_NAME)
+            table_names = self._list_mssql_tunnelled_tables(conn)
+
+        results = []
+        for t in table_names:
+            try:
+                name = self.load_mssql_tunnelled_table(
+                    t, conn,
+                    enriched_metadata=enriched_metadata,
+                )
+                results.append(name)
+            except Exception as exc:
+                logger.warning("Skipping table '%s': %s", t, exc)
+
+        conn.close()
+        return results
+"""
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CHANGE 4 — nl_to_sql_main.py
+# WHERE: DataLoader.load_mssql_tunnelled_table() method signature + body
+# ADD enriched_metadata parameter and inject schema override at the end:
+# ───────────────────────────────────────────────────────────────────────────────
+
+"""
+    def load_mssql_tunnelled_table(
+        self,
+        original_name: str,
+        conn,
+        enriched_metadata: dict = None,     # ← NEW
+    ) -> str:
+        col_rows, row_count, sample_df = self._build_mssql_schema_info(conn, original_name)
+
+        try:
+            keys = self._fetch_mssql_keys(conn, original_name)
+        except Exception as exc:
+            logger.warning("Could not fetch keys for '%s': %s", original_name, exc)
+            keys = {"primary_keys": [], "foreign_keys": [], "unique_keys": []}
+
+        name = _unique_name(_safe_name(original_name), set(self.tables))
+        self.conn.register(name, sample_df.iloc[0:0])
+
+        # ── Build schema_info ─────────────────────────────────────────────────
+        # If enriched metadata is available for this table, use the rich version.
+        # Otherwise fall back to the basic schema builder.
+        if enriched_metadata and original_name in enriched_metadata:
+            from db_metadata_enricher import build_enriched_schema_info
+            schema_info = build_enriched_schema_info(
+                original_name,
+                enriched_metadata[original_name]
+            )
+            # Still build columns list the normal way for DuckDB registration
+            columns, _ = _build_schema_info(
+                f"[dbo].[{original_name}]",
+                f"mssql_tunnel:{original_name}",
+                MSSQL_DB_NAME,
+                sample_df,
+                keys=keys,
+                include_samples=True,
+            )
+            logger.info("Using enriched schema_info for '%s'", original_name)
+        else:
+            columns, schema_info = _build_schema_info(
+                f"[dbo].[{original_name}]",
+                f"mssql_tunnel:{original_name}",
+                MSSQL_DB_NAME,
+                sample_df,
+                keys=keys,
+                include_samples=True,
+            )
+            # Patch row count (sample_df only has a few rows)
+            schema_info = re.sub(
+                r"│  Row count    : [\d,]+",
+                f"│  Row count    : {row_count:,}",
+                schema_info
+            )
+
+        self.tables[name] = TableMeta(
+            table_name  = name,
+            source      = f"mssql_tunnel:{original_name}",
+            db_name     = MSSQL_DB_NAME,
+            row_count   = row_count,
+            columns     = columns,
+            schema_info = schema_info,
+        )
+        self._mssql_table_map[name] = original_name
+
+        logger.info("Registered '%s' — %d rows, %d FKs",
+                    name, row_count, len(keys["foreign_keys"]))
+        return name
+"""
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CHANGE 5 — nl_to_sql_main.py
+# WHERE: SQLValidatorAgent._execute() method
+# REPLACE the method body with this (adds null-density check):
+# ───────────────────────────────────────────────────────────────────────────────
+
+"""
+    def _execute(self, sql: str, tables_used: list = None):
+        try:
+            if tables_used and self._loader.uses_mssql_tables(tables_used):
+                df = self._loader.execute_on_mssql(sql)
+            else:
+                df = self._loader.execute(sql)
+
+            if df is None or (hasattr(df, 'empty') and df.empty
+                              and len(df.columns) == 0):
+                return False, None, "Query returned no columns — likely a schema mismatch."
+
+            # ── Universal data quality check ─────────────────────────────────
+            if not df.empty and len(df) >= 3:
+                for col in df.columns:
+                    null_pct = df[col].isna().mean()
+                    # Only flag non-numeric columns — numeric NULLs can be valid
+                    if null_pct > 0.7 and df[col].dtype == object:
+                        return False, None, (
+                            f"Data quality FAIL: column '{col}' has "
+                            f"{null_pct:.0%} NULL values in the result. "
+                            f"This means the JOIN condition is wrong OR the source "
+                            f"column is mostly empty in the database. "
+                            f"Check the schema — columns marked [MOSTLY NULL] or "
+                            f"[EMPTY] must not be used for JOINs or display. "
+                            f"Find an alternative table/column that has actual data "
+                            f"for the same information (e.g. state/district names "
+                            f"may exist in a different table)."
+                        )
+
+            return True, df, None
+        except Exception as exc:
+            return False, None, str(exc)
+"""
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CHANGE 6 — nl_to_sql_main.py
+# WHERE: _GENERATOR_SYSTEM prompt constant
+# ADD this block at the end of the system prompt (before the closing triple-quote):
+# ───────────────────────────────────────────────────────────────────────────────
+
+"""
+SCHEMA ANNOTATION RULES (MANDATORY — never ignore these):
+- Columns marked [MOSTLY NULL] or [EMPTY]: NEVER use in SELECT, JOIN, or WHERE.
+  If you need that information, look for it in another table in the schema.
+- Columns marked [SPARSE]: use with caution, always add IS NOT NULL filter.
+- When a column description says "MOSTLY EMPTY": treat as non-existent.
+- When column description mentions format like "5 (10%)" or "N (P%)":
+  Extract integer using: TRY_CAST(LEFT([ColName], CHARINDEX(' ', [ColName]+' ')-1) AS INT)
+  NEVER use plain CAST — use TRY_CAST to handle nulls/empty strings safely.
+- Read USAGE NOTES in each table schema before writing any JOIN or SELECT.
+"""
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CHANGE 7 — nl_to_sql_main.py
+# WHERE: _TABLE_SELECTOR_SYSTEM prompt, under STEP 2 (Resolve Ambiguous Language)
+# ADD this section:
+# ───────────────────────────────────────────────────────────────────────────────
+
+"""
+COLUMN USABILITY RULES (check BEFORE choosing any column):
+- Columns annotated with [MOSTLY NULL], [EMPTY], or whose description starts
+  with "MOSTLY EMPTY": these contain almost no data. NEVER use them for:
+    * JOIN conditions (will silently drop most rows)
+    * SELECT output (will return NULLs)
+    * WHERE filters
+- If you need state/district/category names but the obvious column is marked
+  MOSTLY NULL, scan ALL table schemas for an alternative column with actual data.
+- When you find a workaround (using a different table/column), EXPLICITLY state
+  it in your ENRICHED_QUERY:
+    "NOTE: [TableA].[ColX] is mostly empty — using [TableB].[ColY] instead
+     because it contains the same information with actual data."
+- Prefer joining on numeric code columns (Statecode, Districtcode) over name
+  columns when codes are consistently populated.
 """
