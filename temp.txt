@@ -1,100 +1,180 @@
-def _save_query_result(
-    self,
-    question:         str,
-    enriched_query:   str,
-    sql:              str,
-    relevant:         list,
-    rows:             int,
-    cols:             list,
-    data:             list,
-    selector_reasoning: str,
-    viz_meta,
-    csv_path:         str,
-) -> str:
-    """
-    Saves the full query result payload to a JSON file for 
-    debugging and assessment. Returns the json file path.
-    """
-    import json
-
-    if not csv_path:
-        # No CSV means empty result — still save the JSON for debugging
-        slug      = re.sub(r"\W+", "_", question[:40]).strip("_").lower()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_path = str(_ensure_dir(OUTPUT_DIR) / f"{slug}__{timestamp}.json")
-    else:
-        json_path = str(csv_path).replace(".csv", ".json")
-
-    result_dict = {
-        "question":       question,
-        "enriched_query": enriched_query,
-        "sql":            sql,
-        "tables_used":    relevant,
-        "rows":           rows,
-        "columns":        cols,
-        "reasoning":      selector_reasoning,
-        "visualization": {
-            "chart_type":     viz_meta.chart_type     if viz_meta else None,
-            "title":          viz_meta.title           if viz_meta else None,
-            "x_axis":         viz_meta.x_axis          if viz_meta else None,
-            "y_axis":         viz_meta.y_axis          if viz_meta else None,
-            "y_columns":      viz_meta.y_columns        if viz_meta else [],
-            "secondary_axis": viz_meta.secondary_axis   if viz_meta else None,
-            "series_label":   viz_meta.series_label     if viz_meta else None,
-            "reasoning":      viz_meta.reasoning        if viz_meta else None,
-        },
-        "data_sample":  data[:10],   # first 10 rows for debugging
-        "timestamp":    datetime.now().isoformat(),
-    }
-
-    try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(result_dict, f, indent=2, default=str)
-        logger.info("Query result saved → %s", json_path)
-    except Exception as exc:
-        logger.warning("Failed to save query result JSON: %s", exc)
-
-    return json_path
+@dataclass
+class VizMeta:
+    chart_type:      str
+    title:           str
+    x_axis:          Optional[str] = None
+    x_axis_label:    Optional[str] = None    # ← ADD
+    y_axis:          Optional[str] = None
+    y_axis_label:    Optional[str] = None    # ← ADD
+    y_columns:       list          = field(default_factory=list)
+    secondary_axis:  Optional[str] = None
+    series_label:    Optional[str] = None
+    reasoning:       str           = ""
 
 
----------------
+
+----------------
 
 
-# inside query() — in the `if is_valid:` block
-csv_path = None
-if not result_df.empty:
-    csv_path = str(_output_csv_path(question))
-    result_df.to_csv(csv_path, index=False)
+CHART_TYPE: <one of: bar, line, pie, scatter, area, heatmap, table>
+TITLE: <concise chart title, max 10 words>
+X_AXIS: <exact column name for primary/category axis. MANDATORY for bar/line/area/scatter.>
+X_AXIS_LABEL: <human-readable label for X axis — strip underscores, humanize abbreviations.
+               Examples: DistrictName→District, OrderDate→Date, ULB_ID→Urban Local Body.
+               For pie: the slice category label. For scatter: horizontal axis label.>
+Y_AXIS: <exact column name for primary value axis. MANDATORY for bar/line/area/scatter.>
+Y_AXIS_LABEL: <ONE collective human-readable label for what Y measures.
+               For multi-series (L0,L1...): derive collective name e.g. "Maturity Level Count".
+               For single series: humanize column name e.g. total_orders→Total Orders.
+               For pie: the numeric value label e.g. Count, Amount.
+               NEVER use raw column names like L0, cnt, amt_sum here.>
+Y_COLUMNS: <comma-separated list of ALL numeric column names to plot as series.
+            For single-series charts: same as Y_AXIS.
+            For multi-series (grouped/stacked bar, multi-line): ALL numeric cols.
+            Example: L0_count,L1_count,L2_count,L3_count,L4_count,L5_count>
+SECONDARY_AXIS: <column name for secondary axis, or NONE>
+SERIES_LABEL: <for multi-series bar: the human-readable label prefix for the series
+               e.g. "Maturity Level" or "Category". NONE for single-series.>
+REASONING: <3-4 sentences explaining chart choice and series mapping.>
 
-# ✅ Add this right after CSV save
-self._save_query_result(
-    question          = question,
-    enriched_query    = enriched_query,
-    sql               = sql,
-    relevant          = relevant,
-    rows              = rows,
-    cols              = cols,
-    data              = data,
-    selector_reasoning= selector_reasoning,
-    viz_meta          = viz,
-    csv_path          = csv_path,
+
+
+-------------
+
+
+
+
+return VizMeta(
+    chart_type     = chosen_type,
+    title          = _parse("TITLE") or question[:60],
+    x_axis         = x_axis,
+    x_axis_label   = _parse("X_AXIS_LABEL") or x_axis,    # ← ADD
+    y_axis         = y_axis,
+    y_axis_label   = _parse("Y_AXIS_LABEL") or y_axis,    # ← ADD
+    y_columns      = y_columns,
+    secondary_axis = _parse("SECONDARY_AXIS"),
+    series_label   = _parse("SERIES_LABEL"),
+    reasoning      = _parse("REASONING") or "",
 )
 
 
 
----------------
 
 
-# inside stream_query() — right after result_df.to_csv(...)
-self._save_query_result(
-    question          = question,
-    enriched_query    = enriched_query,
-    sql               = sql,
-    relevant          = relevant,
-    rows              = rows,
-    cols              = cols,
-    data              = data,
-    selector_reasoning= selector_reasoning,
-    viz_meta          = viz,         # viz is defined just below — move this call after viz is generated
-    csv_path          = csv_path,
-)
+
+
+
+
+
+
+
+-----------
+
+
+yield sse("viz_meta", {
+    "chart_type":     viz.chart_type,
+    "title":          viz.title,
+    "x_axis":         viz.x_axis,
+    "x_axis_label":   viz.x_axis_label,    # ← ADD
+    "y_axis":         viz.y_axis,
+    "y_axis_label":   viz.y_axis_label,    # ← ADD
+    "y_columns":      viz.y_columns,       # ← ADD (was missing)
+    "secondary_axis": viz.secondary_axis,
+    "series_label":   viz.series_label,
+    "reasoning":      viz.reasoning,
+})
+
+
+
+
+-----------------------
+
+
+## Chart Metadata
+Chart Type   : {chart_type}
+Title        : {title}
+X Axis       : {x_axis}
+X Axis Label : {x_axis_label}
+Y Axis       : {y_axis}
+Y Axis Label : {y_axis_label}
+Y Columns    : {y_columns}
+Series Label : {series_label}
+
+
+
+
+
+-------------------------
+
+
+Before writing code, state:
+- How many rows in the data?
+- How many unique X-axis values?
+- How many unique series/legend items?
+Then apply the label intelligence rules above.
+Use X Axis Label as the axis title on the chart (not the raw X Axis column name).
+Use Y Axis Label as the axis title on the chart (not the raw Y Axis column name).
+
+
+
+
+
+
+
+
+------------------
+
+
+
+response = self._chain.invoke({
+    "question":     question,
+    "chart_type":   viz_meta.chart_type,
+    "title":        viz_meta.title,
+    "x_axis":       viz_meta.x_axis       or "None",
+    "x_axis_label": viz_meta.x_axis_label or viz_meta.x_axis or "None",    # ← ADD
+    "y_axis":       viz_meta.y_axis       or "None",
+    "y_axis_label": viz_meta.y_axis_label or viz_meta.y_axis or "None",    # ← ADD
+    "y_columns":    ", ".join(viz_meta.y_columns) if viz_meta.y_columns else (viz_meta.y_axis or "None"),
+    "series_label": viz_meta.series_label or "None",
+    "columns":      ", ".join(columns),
+    "sample_data":  str(data[:10]),
+})
+
+
+
+
+
+
+
+
+
+---
+
+
+function buildMetaGrid(tablesUsed, viz) {
+  const wrap = document.createElement('div');
+  wrap.className = 'meta-grid';
+
+  // Use human-readable labels if available, fallback to raw column name
+  const xDisplay = viz.x_axis_label || viz.x_axis || '—';
+  const yDisplay = viz.y_axis_label || viz.y_axis || '—';
+
+  wrap.innerHTML = `
+    <div class="meta-card">
+      <div class="meta-label">Chart type</div>
+      <div class="meta-value"><span class="meta-pill chart">${escHtml(viz.chart_type)}</span></div>
+    </div>
+    <div class="meta-card">
+      <div class="meta-label">Tables used</div>
+      <div class="meta-value">${tablesUsed.map(t => `<span class="meta-pill table-pill">${escHtml(t)}</span>`).join('')}</div>
+    </div>
+    <div class="meta-card">
+      <div class="meta-label">X axis</div>
+      <div class="meta-value">${escHtml(xDisplay)}</div>
+    </div>
+    <div class="meta-card">
+      <div class="meta-label">Y axis</div>
+      <div class="meta-value">${escHtml(yDisplay)}</div>
+    </div>`;
+  return wrap;
+}
