@@ -1,110 +1,16 @@
-def _build_mssql_schema_info(self, conn, original_name: str) -> tuple:
-    cursor = conn.cursor()
+function addOrReplaceTimestamp(tokens) {
+  if (tsSpan) tsSpan.remove();
+  tsSpan = document.createElement('span');
+  tsSpan.className = 'msg-ts';
+  const timeStr = nowTs();
 
-    # ── Column info ──────────────────────────────────────────────────
-    cursor.execute(f"""
-        SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_CATALOG = 'FCI'
-        AND TABLE_SCHEMA  = 'dbo'
-        AND TABLE_NAME    = ?
-        ORDER BY ORDINAL_POSITION
-    """, original_name)
-    col_rows = cursor.fetchall()
+  if (tokens != null) {
+    tsSpan.innerHTML =
+      `<strong style="color:var(--text-primary);font-weight:600;">${tokens.toLocaleString()} tokens</strong>` +
+      `<span style="color:var(--text-muted);margin-left:4px;">| ${timeStr}</span>`;
+  } else {
+    tsSpan.textContent = timeStr;
+  }
 
-    # ── Row count ────────────────────────────────────────────────────
-    cursor.execute(f"SELECT COUNT(*) FROM [dbo].[{original_name}]")
-    row_count = cursor.fetchone()[0]
-
-    # ── Per-column: first 10 unique non-null values ──────────────────
-    col_samples = {}
-    for col in col_rows:
-        col_name = col[0]
-        col_type = col[1].lower()
-
-        # Only fetch sample values for text/categorical columns
-        # Numeric and datetime columns don't help the agent understand meaning
-        if col_type not in ('varchar', 'nvarchar', 'char', 'nchar', 'text', 'ntext'):
-            col_samples[col_name] = []
-            continue
-
-        try:
-            cursor.execute(f"""
-                SELECT DISTINCT TOP 10 [{col_name}]
-                FROM [dbo].[{original_name}]
-                WHERE [{col_name}] IS NOT NULL
-                AND LTRIM(RTRIM(CAST([{col_name}] AS NVARCHAR(MAX)))) != ''
-            """)
-            values = [str(row[0]).strip() for row in cursor.fetchall() if row[0] is not None]
-            col_samples[col_name] = values
-        except Exception:
-            col_samples[col_name] = []
-
-    # ── Build sample_df from per-column results ──────────────────────
-    # Pad all columns to same length so DataFrame is valid
-    max_len = max((len(v) for v in col_samples.values()), default=0)
-    max_len = max(max_len, 1)  # at least 1 row
-
-    sample_data = {}
-    for col_name, vals in col_samples.items():
-        padded = vals + [None] * (max_len - len(vals))
-        sample_data[col_name] = padded
-
-    # Add numeric/datetime columns as empty so DataFrame has all columns
-    all_col_names = [c[0] for c in col_rows]
-    for col_name in all_col_names:
-        if col_name not in sample_data:
-            sample_data[col_name] = [None] * max_len
-
-    sample_df = pd.DataFrame(sample_data)
-
-    return col_rows, row_count, sample_df
-
-
-
-------------------------
-
-
-
-
-if is_valid:
-    rows, cols, data = _df_to_response(result_df)
-    csv_path = None
-    if not result_df.empty:
-        csv_path = str(_output_csv_path(question))
-        result_df.to_csv(csv_path, index=False)
-
-    # ── Agent 3 — Viz metadata ── (must come BEFORE _save_query_result)
-    viz = self._viz_agent.generate(
-        question    = question,
-        sql         = sql,
-        columns     = cols,
-        sample_data = data,
-    )
-
-    # ── Now save — viz is defined ──
-    self._save_query_result(
-        question           = question,
-        enriched_query     = enriched_query,
-        sql                = sql,
-        relevant           = relevant,
-        rows               = rows,
-        cols               = cols,
-        data               = data,
-        selector_reasoning = selector_reasoning,
-        viz_meta           = viz,
-        csv_path           = csv_path,
-    )
-
-    # ── Agent 4 — Plotly chart ──
-    plotly_result = self._plotly.generate(
-        question = question,
-        viz_meta = viz,
-        columns  = cols,
-        data     = data,
-    )
-
-
-
-
-
+  bw.appendChild(tsSpan);
+}
