@@ -1,100 +1,319 @@
+def select(self, all_schemas, question, available_tables, pinned_tables=None, token_log=None):
+    if pinned_tables:
+        return pinned_tables, "Tables manually pinned by user.", question  # ← add question as enriched fallback
+
+    if len(available_tables) == 1:
+        return available_tables, f"Only one table available: '{available_tables[0]}'.", question
+
+    try:
+        response  = self._chain.invoke({"all_schemas": all_schemas, "question": question})
+        if token_log is not None:
+            token_log.append(_extract_tokens(response))
+        text      = response.content.strip()
+
+        t_match   = re.search(r"TABLES:\s*(.+)",         text, re.IGNORECASE)
+        r_match   = re.search(r"REASONING:\s*(.+?)(?=ENRICHED_QUERY:|$)", text, re.IGNORECASE | re.DOTALL)
+        e_match   = re.search(r"ENRICHED_QUERY:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+
+        raw_tables     = t_match.group(1).strip() if t_match else ""
+        reasoning      = r_match.group(1).strip() if r_match else ""
+        enriched_query = e_match.group(1).strip() if e_match else question  # ← fallback to original
+
+        selected = [t.strip() for t in raw_tables.split(",") if t.strip()]
+        valid    = [t for t in selected if t in available_tables]
+
+        if valid:
+            return valid, reasoning, enriched_query  # ← now returns 3 values
+
+        raise ValueError(f"Table selector returned no valid table names from response: {text!r}")
+
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Table selection failed: {exc}") from exc
+
+
+
+
+---------------------
+
+
+
+
+_TABLE_SELECTOR_SYSTEM = """
+You are a data analyst assistant. Select the minimum set of tables needed to
+answer the user's question — no more, no fewer.
+
+Each table entry shows:
+  INTERNAL_NAME | display: [dbo].[ActualName] | (N rows) | columns: col1, col2, ...
+
+Selection rules (apply in order, stop at first match):
+1. If one table contains ALL needed columns → use only that table.
+2. If a JOIN is needed → use exactly the tables required for that JOIN, no extras.
+3. If multiple tables could work → prefer the one whose name or columns most
+   closely match the user's wording. Commit to that choice — do not alternate.
+4. Never include a table "just in case" — only include if directly needed.
+5. Use ONLY the INTERNAL_NAME (before the | symbol) in your response.
+
+Return ONLY this format — nothing else:
+
+TABLES: internal_name1,internal_name2
+REASONING: <2-3 sentences explaining which tables you chose and why>
+ENRICHED_QUERY: <
+  Interpret what the user truly wants — not just what they literally said.
+  Resolve ambiguous terms (e.g. "top", "best", "distribution", "performance")
+  by mapping them to concrete operations available in the schema.
+  
+  Your enriched query must answer all of these internally before writing:
+  - What is the user's core intent? (rank, count, compare, trend, filter, summarise)
+  - What entity are they asking about? (map to the most relevant table + primary column)
+  - What measure defines "best/top/most/highest"? (map to exact column + aggregation)
+  - What dimension should results be grouped or broken down by? (GROUP BY column)
+  - Is there a ranking or limit implied? (TOP N — extract N or default to 10)
+  - Are multiple tables needed? (identify JOIN path via FK relationships)
+  - Are there any filters implied by the question? (WHERE conditions)
+  - What data types are involved? (affects whether to use COUNT, SUM, AVG, or CAST)
+  
+  Write one clear, precise sentence that a SQL engineer could directly convert to 
+  a query — using actual column names from the schema, stating the aggregation, 
+  grouping dimension, order direction, and row limit explicitly.
+  
+  If the question is already fully unambiguous and maps directly to the schema 
+  with no interpretation needed, repeat it unchanged.
+  
+  Do NOT mention table names in bracket format here — use natural names.
+  Do NOT write SQL — write a precise natural language specification.
+>
 """
-## Chart Layout Rules (mandatory, apply to every chart)
-- Set Chart.js layout: { padding: { top: 10, right: 16, bottom: 10, left: 0 } }
-- Set legend: { display: false } when series count > 10
-- Set maintainAspectRatio: false and let the container control height
-- The chart HTML body must have: margin:0; padding:0; overflow:hidden; background:transparent
-- The <canvas> must be: width:100%; height:100%; display:block
-- The container div wrapping canvas must be: width:100%; height:100vh; padding:0; margin:0
-- Y-axis title: set display:false — the axis values are self-explanatory
-- Minimize all default Chart.js whitespace reserves
+
+
+
+---------------------------
+
+
+
+@dataclass
+class QueryResult:
+    success:        bool
+    final_sql:      str
+    rows:           int           = 0
+    columns:        list          = field(default_factory=list)
+    data:           list          = field(default_factory=list)
+    tables_used:    list          = field(default_factory=list)
+    attempts:       int           = 0
+    output_csv:     Optional[str] = None
+    history:        list          = field(default_factory=list)
+    error:          Optional[str] = None
+    reasoning:      str           = ""
+    enriched_query: str           = ""        # ← ADD THIS
+    viz_meta:       Optional[any] = None
+    column_roles:   dict          = field(default_factory=dict)
+    plotly_code:    str           = ""
+    output_html:    Optional[str] = None
+    plotly_error:   Optional[str] = None
+
+
+
+----------------
+
+
+
+# Before (2-tuple)
+relevant, selector_reasoning = self._selector.select(
+    all_schemas      = ...,
+    question         = question,
+    available_tables = ...,
+    pinned_tables    = pinned_tables,
+    token_log        = token_log,
+)
+
+# After (3-tuple)
+relevant, selector_reasoning, enriched_query = self._selector.select(
+    all_schemas      = ...,
+    question         = question,
+    available_tables = ...,
+    pinned_tables    = pinned_tables,
+    token_log        = token_log,
+)
+
+
+
+
+-------------------
+
+
+# In the SQL generation call inside query()
+sql = self._gen_chain.generate(
+    schema        = schema,
+    question      = question,          # ← keep original for intent anchor
+    enriched_query = enriched_query,   # ← ADD: new param
+    prev_sql      = prev_sql,
+    error         = error,
+    lint_warnings = lint_warnings,
+    dialect       = dialect,
+    token_log     = token_log,
+)
+
+
+
+
+-------------------
+
+
+
+return QueryResult(
+    ...
+    enriched_query = enriched_query,   # ← ADD
+    ...
+)
+
+
+
+
+
+
+
+
+
+
+
+------------
+
+# In _GENERATOR_HUMAN, update the human prompt template:
+_GENERATOR_HUMAN = """
+## Table Schemas
+{schema}
+
+## Original User Question
+{question}
+
+## Enriched Query (schema-grounded interpretation)
+{enriched_query}
+
+Use the enriched query as the primary specification for writing SQL.
+Use the original question only to verify intent alignment.
+
+{error_context}
+
+SQL:
 """
+
+# In _SQLGeneratorChain.generate() signature:
+def generate(
+    self,
+    schema:         str,
+    question:       str,
+    enriched_query: str           = "",    # ← ADD
+    prev_sql:       Optional[str] = None,
+    error:          Optional[str] = None,
+    lint_warnings:  list          = [],
+    dialect:        str           = "duckdb",
+    token_log=None,
+) -> str:
+
+    # In the chain.invoke() call:
+    response = chain.invoke({
+        "schema":          schema,
+        "question":        question,
+        "enriched_query":  enriched_query or question,  # fallback to original
+        "error_context":   error_context,
+    })
+
+
+
+
+
+
+
+
+
+
+----------------
+yield f"event: tables_selected\ndata: {json.dumps({
+    'tables':          relevant,
+    'reasoning':       selector_reasoning,
+    'enriched_query':  enriched_query,    # ← ADD THIS
+})}\n\n"
+
+
+
+
+
+
+
+
+
+------
+
+
+relevant, selector_reasoning, enriched_query = self._selector.select(...)
+
+
+
+
+
+-------------
+
+
+return _ok({
+    "sql":            result.final_sql,
+    "rows":           result.rows,
+    "columns":        result.columns,
+    "data":           result.data,
+    "tables_used":    result.tables_used,
+    "attempts":       result.attempts,
+    "output_csv":     result.output_csv,
+    "history":        result.history,
+    "reasoning":      result.reasoning,
+    "enriched_query": result.enriched_query,   # ← ADD
+    "column_roles":   result.column_roles,
+    "visualization":  { ... },
+    "chart":          { ... },
+})
+
+
 
 
 ----------
 
 
-case 'chart_ready': {
-  if (payload.chart_type_changed && payload.actual_chart_type && metaBlock) {
-    const chartPill = metaBlock.querySelector('.meta-pill.chart');
-    if (chartPill) chartPill.textContent = payload.actual_chart_type;
-    if (vizData) vizData.chart_type = payload.actual_chart_type;
-  }
+case 'tables_selected': {
+  tablesUsed = payload.tables || [];
+  const enriched = payload.enriched_query || '';
 
-  if (payload.output_html) {
-    const chartFile = payload.output_html.split('/').pop();
-    chartBlock = buildChartFrame(chartFile, vizData?.title || 'Chart');
+  addThinkingStep(
+    'tables', 'T',
+    `<strong>Tables selected:</strong> ${escHtml(tablesUsed.join(', '))}<br>
+     <span style="color:var(--text-muted)">${escHtml(payload.reasoning || '')}</span>
+     ${enriched ? `
+       <div style="
+         margin-top: 8px;
+         padding: 8px 11px;
+         background: var(--blue-50);
+         border: 1px solid var(--blue-100);
+         border-radius: var(--radius-sm);
+         font-size: 12px;
+         line-height: 1.55;
+         color: var(--blue-800);
+       ">
+         <span style="
+           font-size: 10px;
+           font-weight: 600;
+           letter-spacing: 0.6px;
+           text-transform: uppercase;
+           color: var(--blue-600);
+           display: block;
+           margin-bottom: 4px;
+         ">Understood as</span>
+         ${escHtml(enriched)}
+       </div>` : ''}
+    `
+  );
 
-    // ← Insert DIRECTLY into bw, before timestamp, NOT inside any bubble
-    if (tsSpan && tsSpan.parentNode === bw) {
-      bw.insertBefore(chartBlock, tsSpan);
-    } else {
-      bw.appendChild(chartBlock);
-    }
-    snapshot.chart = chartBlock;
-  } else if (payload.error) {
-    const errEl = buildErrorEl(`Chart generation failed: ${payload.error}`);
-    bw.appendChild(errEl);
-  }
   addOrReplaceTimestamp();
-  scrollToBottom();
+  updateProcessingBar('sql', '⟨⟩', 'Generating SQL query…');
   break;
 }
 
 
----------------
 
-
-
-function buildChartFrame(chartFile, title) {
-  const wrap = document.createElement('div');
-  wrap.className = 'chart-frame-wrap';
-  wrap.style.cssText = 'width:100%; background:transparent; border:none; border-radius:0; padding:0; margin-top:6px;';
-
-  const header = document.createElement('div');
-  header.className = 'chart-frame-header';
-  header.innerHTML = `
-    <button class="chart-open-btn"
-      onclick="openChartModal('${API_BASE}/chart/${encodeURIComponent(chartFile)}', '${(title||'Chart').replace(/'/g,"\\'")}')">
-      <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
-        <path d="M19 19H5V5h7V3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/>
-      </svg>
-      Expand chart
-    </button>`;
-
-  const iframe = document.createElement('iframe');
-  iframe.className = 'chart-iframe';
-  iframe.src = `${API_BASE}/chart/${encodeURIComponent(chartFile)}`;
-  iframe.loading = 'lazy';
-  iframe.style.cssText = 'width:100%; height:420px; border:none; border-radius:var(--radius-md); display:block; background:transparent;';
-
-  iframe.onload = () => {
-    try {
-      const idoc = iframe.contentDocument || iframe.contentWindow.document;
-      const style = idoc.createElement('style');
-      style.textContent = `
-        html, body {
-          margin: 0 !important; padding: 0 !important;
-          overflow: hidden !important; background: transparent !important;
-          width: 100% !important; height: 100% !important;
-        }
-        canvas { display: block !important; }
-        /* Tighten Chart.js default padding */
-        .chart-container, [class*="chart"] {
-          padding: 0 !important;
-        }
-      `;
-      idoc.head.appendChild(style);
-
-      // Auto-height: use scrollHeight but cap between 320-600px
-      const h = idoc.body.scrollHeight;
-      if (h && h > 100) {
-        iframe.style.height = Math.min(Math.max(h, 320), 600) + 'px';
-      }
-    } catch { /* cross-origin */ }
-  };
-
-  wrap.appendChild(header);
-  wrap.appendChild(iframe);
-  return wrap;
-}
