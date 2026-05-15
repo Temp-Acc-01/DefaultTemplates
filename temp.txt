@@ -1,227 +1,67 @@
-<div class="topbar">
-    <span class="topbar-title" id="session-title">New conversation</span>
-    <span class="topbar-badge" id="tables-badge">Loading…</span>
-    <div class="back-btn-wrap" title="Back to dashboard">
-      <button class="back-btn" onclick="confirmBackToDashboard()">
-        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M19 12H5M12 5l-7 7 7 7"/>
-        </svg>
-        Back
-      </button>
-      <div class="back-btn-tooltip">Back to dashboard</div>
-    </div>
+/* FIND this: */
+.logo-sub { font-size: 10px; color: var(--text-muted); letter-spacing: 0.8px; text-transform: uppercase; font-weight: 500; margin-top: 1px; }
+
+/* REPLACE with: */
+.logo-sub { font-size: 10px; color: var(--text-muted); letter-spacing: 0.8px; text-transform: uppercase; font-weight: 500; margin-top: 0; }
+
+
+
+
+-------------------
+
+
+<!-- FIND this: -->
+<div class="logo">
+  <div>
+    <div class="logo-text">Sarthi</div>
+    <div class="logo-sub">Data Navigator</div>
   </div>
+</div>
 
-
-
-------------
-
-/* ── Back to dashboard button ── */
-  .back-btn-wrap {
-    position: relative;
-    flex-shrink: 0;
-  }
-
-  .back-btn {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    padding: 4px 11px;
-    font-size: 11.5px;
-    font-family: 'DM Sans', sans-serif;
-    font-weight: 500;
-    color: #9B4040;
-    background: #FDF1F1;
-    border: 1px solid #F2CACA;
-    border-radius: 20px;
-    cursor: pointer;
-    transition: background 0.15s, border-color 0.15s, color 0.15s;
-    letter-spacing: 0.1px;
-  }
-
-  .back-btn:hover {
-    background: #F9E3E3;
-    border-color: #E8AFAF;
-    color: #7A2E2E;
-  }
-
-  .back-btn-tooltip {
-    position: absolute;
-    top: calc(100% + 7px);
-    right: 0;
-    background: rgba(26, 37, 53, 0.88);
-    color: #fff;
-    font-size: 10.5px;
-    font-family: 'DM Sans', sans-serif;
-    padding: 4px 9px;
-    border-radius: 6px;
-    white-space: nowrap;
-    pointer-events: none;
-    opacity: 0;
-    transform: translateY(-3px);
-    transition: opacity 0.15s, transform 0.15s;
-    z-index: 100;
-  }
-
-  .back-btn-wrap:hover .back-btn-tooltip {
-    opacity: 1;
-    transform: translateY(0);
-  }
-
-  /* ── Back confirmation modal ── */
-  .back-confirm-overlay {
-    display: none;
-    position: fixed;
-    inset: 0;
-    z-index: 4000;
-    align-items: center;
-    justify-content: center;
-    background: rgba(15, 25, 50, 0.3);
-    backdrop-filter: blur(2px);
-    animation: fadeUp 0.15s ease;
-  }
-
-  .back-confirm-overlay.open {
-    display: flex;
-  }
-
-  .back-confirm-card {
-    background: var(--surface);
-    border: 1px solid var(--border-md);
-    border-radius: var(--radius-lg);
-    box-shadow: 0 8px 32px rgba(15, 25, 50, 0.12);
-    padding: 22px 24px 18px;
-    width: 320px;
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    animation: fadeUp 0.18s ease;
-  }
-
-  .back-confirm-icon {
-    width: 32px;
-    height: 32px;
-    border-radius: 50%;
-    background: #FDF1F1;
-    border: 1px solid #F2CACA;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-  }
-
-  .back-confirm-title {
-    font-size: 13.5px;
-    font-weight: 600;
-    color: var(--text-primary);
-    letter-spacing: -0.1px;
-  }
-
-  .back-confirm-body {
-    font-size: 12.5px;
-    color: var(--text-muted);
-    line-height: 1.55;
-    margin-top: -6px;
-  }
-
-  .back-confirm-actions {
-    display: flex;
-    gap: 8px;
-    justify-content: flex-end;
-    margin-top: 2px;
-  }
-
-  .back-confirm-cancel {
-    padding: 5px 14px;
-    font-size: 12px;
-    font-family: 'DM Sans', sans-serif;
-    font-weight: 500;
-    color: var(--text-muted);
-    background: transparent;
-    border: 1px solid var(--border-md);
-    border-radius: 20px;
-    cursor: pointer;
-    transition: background 0.12s, color 0.12s;
-  }
-
-  .back-confirm-cancel:hover {
-    background: var(--slate-100);
-    color: var(--text-primary);
-  }
-
-  .back-confirm-go {
-    padding: 5px 14px;
-    font-size: 12px;
-    font-family: 'DM Sans', sans-serif;
-    font-weight: 500;
-    color: #9B4040;
-    background: #FDF1F1;
-    border: 1px solid #F2CACA;
-    border-radius: 20px;
-    cursor: pointer;
-    transition: background 0.12s, color 0.12s, border-color 0.12s;
-  }
-
-  .back-confirm-go:hover {
-    background: #F9E3E3;
-    border-color: #E8AFAF;
-    color: #7A2E2E;
-  }
-
-
---------
-
-
-<!-- Back to dashboard confirmation -->
-<div class="back-confirm-overlay" id="back-confirm-overlay">
-  <div class="back-confirm-card">
-    <div style="display:flex; align-items:center; gap:10px;">
-      <div class="back-confirm-icon">
-        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#C05050" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M19 12H5M12 5l-7 7 7 7"/>
-        </svg>
-      </div>
-      <span class="back-confirm-title">Leave this session?</span>
-    </div>
-    <p class="back-confirm-body">Your current analysis and conversation will not be saved when you go back.</p>
-    <div class="back-confirm-actions">
-      <button class="back-confirm-cancel" onclick="closeBackConfirm()">Stay here</button>
-      <button class="back-confirm-go" onclick="goToDashboard()">Go back</button>
-    </div>
+<!-- REPLACE with: -->
+<div class="logo">
+  <div style="display:flex; align-items:baseline; gap:7px;">
+    <div class="logo-text">Sarthi</div>
+    <div class="logo-sub">Data Navigator</div>
   </div>
 </div>
 
 
---------------
+
+----------
 
 
-
-// ─── Back to dashboard ───────────────────────────────────────────
-const DASHBOARD_URL = 'http://YOUR_IP:YOUR_PORT';  // ← replace with your dashboard route
-
-function confirmBackToDashboard() {
-  document.getElementById('back-confirm-overlay').classList.add('open');
-  document.body.style.overflow = 'hidden';
+.sidebar-back { padding: 10px 16px 6px; }
+.back-btn {
+  background: none; border: none; cursor: pointer;
+  font-size: 11.5px; color: var(--text-muted);
+  font-family: 'DM Sans', sans-serif; font-weight: 500;
+  display: flex; align-items: center; gap: 5px;
+  padding: 3px 0;
+  transition: color 0.12s;
+  letter-spacing: 0.1px;
 }
-
-function closeBackConfirm() {
-  document.getElementById('back-confirm-overlay').classList.remove('open');
-  document.body.style.overflow = '';
-}
-
-function goToDashboard() {
-  closeBackConfirm();
-  window.location.href = DASHBOARD_URL;
-}
-
-// Close on overlay backdrop click
-document.getElementById('back-confirm-overlay')?.addEventListener('click', function(e) {
-  if (e.target === this) closeBackConfirm();
-});
+.back-btn:hover { color: var(--text-primary); }
+.back-btn svg { width: 13px; height: 13px; }
 
 
+----------
 
---------
+<!-- FIND this: -->
+<aside class="sidebar">
+  <div class="sidebar-header">
+
+<!-- REPLACE with: -->
+<aside class="sidebar">
+  <div class="sidebar-back">
+    <button class="back-btn" onclick="history.back()">
+      <svg viewBox="0 0 24 24" fill="currentColor">
+        <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
+      </svg>
+      Back
+    </button>
+  </div>
+  <div class="sidebar-header">
 
 
 
