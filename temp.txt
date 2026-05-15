@@ -1,26 +1,682 @@
-.logo-sub { font-size: 10px; color: var(--text-muted); letter-spacing: 0.8px; text-transform: uppercase; font-weight: 500; margin-top: 0; }
+"""
+auth.py
+========
+Login / session management module for Sarthi NL-to-SQL chat UI.
+
+Features:
+- MySQL-based user store (table: nlq_user_details)
+- Password hashing with bcrypt
+- Flask session-based auth
+- Login / logout endpoints
+- @login_required decorator for protecting routes
+
+MySQL connection: nabh / nabh@123 / NABH
+Table: nlq_user_details (username, password, api_tokens)
+
+Integration: import and call register_auth(app) from app.py
+"""
+
+import os
+import logging
+import functools
+import pymysql
+import pymysql.cursors
+import bcrypt
+
+from flask import (
+    Blueprint, request, jsonify, session,
+    redirect, url_for, make_response,
+)
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
+MYSQL_HOST   = os.environ.get("AUTH_MYSQL_HOST",   "localhost")
+MYSQL_PORT   = int(os.environ.get("AUTH_MYSQL_PORT", 3306))
+MYSQL_USER   = os.environ.get("AUTH_MYSQL_USER",   "nabh")
+MYSQL_PASS   = os.environ.get("AUTH_MYSQL_PASS",   "nabh@123")
+MYSQL_DB     = os.environ.get("AUTH_MYSQL_DB",     "NABH")
+TABLE_NAME   = "nlq_user_details"
+
+# Flask session secret — override via env in production
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "sarthi-secret-change-in-prod-2026")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DB helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_conn():
+    return pymysql.connect(
+        host        = MYSQL_HOST,
+        port        = MYSQL_PORT,
+        user        = MYSQL_USER,
+        password    = MYSQL_PASS,
+        database    = MYSQL_DB,
+        cursorclass = pymysql.cursors.DictCursor,
+        connect_timeout = 10,
+    )
+
+
+def ensure_table():
+    """
+    Create nlq_user_details if it doesn't exist.
+    Call once at app startup.
+    Password column stores bcrypt hash (varchar 255).
+    """
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        id          INT AUTO_INCREMENT PRIMARY KEY,
+        username    VARCHAR(120) NOT NULL UNIQUE,
+        password    VARCHAR(255) NOT NULL,
+        api_tokens  TEXT         DEFAULT NULL,
+        created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+        conn.commit()
+        conn.close()
+        logger.info("Auth table '%s' ready.", TABLE_NAME)
+    except Exception as e:
+        logger.error("Could not ensure auth table: %s", e)
+
+
+def _lookup_user(identifier: str):
+    """
+    Find user by username OR email (both stored in the username column).
+    Returns dict with {username, password, api_tokens} or None.
+    """
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT username, password, api_tokens "
+                f"FROM {TABLE_NAME} WHERE username = %s LIMIT 1",
+                (identifier,)
+            )
+            row = cur.fetchone()
+        conn.close()
+        return row
+    except Exception as e:
+        logger.error("DB lookup failed: %s", e)
+        return None
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    """Compare plain password against bcrypt hash."""
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except Exception:
+        return False
+
+
+def hash_password(plain: str) -> str:
+    """Utility: hash a password for inserting a new user."""
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Blueprint
+# ─────────────────────────────────────────────────────────────────────────────
+
+auth_bp = Blueprint("auth", __name__)
+
+
+@auth_bp.route("/auth/login", methods=["POST"])
+def login():
+    """
+    POST /auth/login
+    Body: { "identifier": "username_or_email", "password": "..." }
+    Returns: { "status": "success" } or { "status": "error", "message": "..." }
+    """
+    body       = request.get_json(silent=True) or {}
+    identifier = (body.get("identifier") or "").strip()
+    password   = (body.get("password")   or "").strip()
+
+    if not identifier or not password:
+        return jsonify({"status": "error", "message": "Username and password are required."}), 400
+
+    user = _lookup_user(identifier)
+
+    if not user:
+        return jsonify({"status": "error", "message": "Incorrect username or password."}), 401
+
+    if not _verify_password(password, user["password"]):
+        return jsonify({"status": "error", "message": "Incorrect username or password."}), 401
+
+    # Set session
+    session.permanent = True
+    session["username"] = user["username"]
+    logger.info("User '%s' logged in.", user["username"])
+
+    return jsonify({"status": "success", "username": user["username"]})
+
+
+@auth_bp.route("/auth/logout", methods=["POST"])
+def logout():
+    """POST /auth/logout — clears session."""
+    username = session.pop("username", None)
+    if username:
+        logger.info("User '%s' logged out.", username)
+    return jsonify({"status": "success"})
+
+
+@auth_bp.route("/auth/me", methods=["GET"])
+def me():
+    """GET /auth/me — returns current user or 401."""
+    if "username" in session:
+        return jsonify({"status": "success", "username": session["username"]})
+    return jsonify({"status": "error", "message": "Not authenticated."}), 401
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# login_required decorator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def login_required(f):
+    """
+    Decorator for Flask route functions.
+    If session has no username, returns 401 JSON for API routes,
+    or redirects to / (login page) for browser routes.
+    """
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if "username" not in session:
+            # API routes (XHR) get JSON 401
+            if request.is_json or request.path.startswith(("/query", "/generate", "/execute", "/tables", "/upload", "/download", "/chart", "/health")):
+                return jsonify({"status": "error", "message": "Not authenticated."}), 401
+            return redirect("/")
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Registration helper — call from app.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def register_auth(app):
+    """
+    Call this from app.py's create_app() BEFORE registering other routes.
+
+    Sets secret key, registers auth blueprint, ensures DB table exists,
+    and wraps all data routes with login_required.
+    """
+    app.secret_key = SESSION_SECRET
+
+    # Register blueprint
+    app.register_blueprint(auth_bp)
+
+    # Ensure table exists
+    ensure_table()
+
+    logger.info("Auth module registered.")
 
 
 
-------
-
-
-.sidebar-header .logo > div { display: flex; align-items: baseline; gap: 7px; }
-.sidebar-back { padding: 8px 20px 0; }
-.back-btn { background: none; border: none; cursor: pointer; font-size: 11.5px; color: var(--text-muted); font-family: 'DM Sans', sans-serif; font-weight: 500; display: flex; align-items: center; gap: 4px; padding: 2px 0; transition: color 0.12s; }
-.back-btn:hover { color: var(--text-primary); }
-.back-btn svg { width: 13px; height: 13px; }
+-------------------
 
 
 
--------------
 
 
-<aside class="sidebar">
-  <div class="sidebar-back">
-    <button class="back-btn" onclick="history.back()">
-      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
-      Back
-    </button>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sarthi — Sign in</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Serif+Display:ital@0;1&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --blue-50: #EBF4FF;
+    --blue-100: #C8E2FF;
+    --blue-200: #A0CAFF;
+    --blue-400: #5BA3F5;
+    --blue-600: #2979D9;
+    --blue-800: #1A4F9C;
+    --teal-400: #2BBFA5;
+    --teal-600: #1A8C78;
+    --slate-50: #F7F9FC;
+    --slate-100: #EEF2F8;
+    --slate-200: #DDE4F0;
+    --slate-300: #C4CFDF;
+    --slate-500: #7A8BA8;
+    --text-primary: #1A2535;
+    --text-secondary: #4A5E7A;
+    --text-muted: #7A8BA8;
+    --surface: #FFFFFF;
+    --border: rgba(100,130,180,0.15);
+    --border-md: rgba(100,130,180,0.25);
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 18px;
+    --radius-xl: 24px;
+    --bg: #F4F7FC;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text-primary);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  /* subtle grid bg */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(100,130,180,0.06) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(100,130,180,0.06) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .login-card {
+    position: relative;
+    z-index: 1;
+    background: var(--surface);
+    border: 1px solid var(--border-md);
+    border-radius: var(--radius-xl);
+    box-shadow:
+      0 4px 24px rgba(41,121,217,0.07),
+      0 1px 4px rgba(0,0,0,0.04);
+    width: 100%;
+    max-width: 400px;
+    padding: 36px 36px 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+    animation: slideUp 0.3s ease;
+  }
+
+  @keyframes slideUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ── Brand ── */
+  .brand {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+
+  .brand-name {
+    font-family: 'DM Serif Display', serif;
+    font-size: 26px;
+    color: var(--text-primary);
+    letter-spacing: -0.4px;
+    line-height: 1;
+  }
+
+  .brand-sub {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    letter-spacing: 0.9px;
+    text-transform: uppercase;
+    font-weight: 500;
+  }
+
+  .brand-tagline {
+    margin-top: 10px;
+    font-size: 13.5px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    font-weight: 400;
+  }
+
+  /* ── Form ── */
+  .form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .form-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    letter-spacing: 0.3px;
+  }
+
+  .input-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
+  .input-icon {
+    position: absolute;
+    left: 13px;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    pointer-events: none;
+  }
+
+  input[type="text"],
+  input[type="password"],
+  input[type="email"] {
+    width: 100%;
+    padding: 10px 14px 10px 38px;
+    border: 1.5px solid var(--border-md);
+    border-radius: var(--radius-md);
+    background: var(--slate-50);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 14px;
+    color: var(--text-primary);
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+  }
+
+  input:focus {
+    border-color: var(--blue-400);
+    background: var(--surface);
+    box-shadow: 0 0 0 3px rgba(59,130,246,0.08);
+  }
+
+  input::placeholder {
+    color: var(--slate-300);
+    font-size: 13.5px;
+  }
+
+  /* password toggle */
+  .pw-toggle {
+    position: absolute;
+    right: 12px;
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--text-muted);
+    padding: 2px;
+    display: flex;
+    align-items: center;
+    transition: color 0.12s;
+  }
+
+  .pw-toggle:hover { color: var(--text-secondary); }
+
+  /* ── Error message ── */
+  .error-msg {
+    display: none;
+    align-items: center;
+    gap: 7px;
+    padding: 10px 13px;
+    background: #FFF3F3;
+    border: 1px solid #FFCDD2;
+    border-radius: var(--radius-sm);
+    font-size: 12.5px;
+    color: #B71C1C;
+    animation: shake 0.35s ease;
+  }
+
+  .error-msg.show { display: flex; }
+
+  @keyframes shake {
+    0%,100% { transform: translateX(0); }
+    20%,60% { transform: translateX(-5px); }
+    40%,80% { transform: translateX(5px); }
+  }
+
+  /* ── Submit button ── */
+  .submit-btn {
+    width: 100%;
+    padding: 11px 20px;
+    background: var(--blue-600);
+    color: white;
+    border: none;
+    border-radius: var(--radius-md);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    letter-spacing: 0.1px;
+  }
+
+  .submit-btn:hover  { background: var(--blue-800); }
+  .submit-btn:active { transform: scale(0.98); }
+
+  .submit-btn:disabled {
+    background: var(--slate-200);
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  /* spinner inside button */
+  .btn-spinner {
+    display: none;
+    width: 15px; height: 15px;
+    border: 2px solid rgba(255,255,255,0.4);
+    border-top-color: white;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+
+  .submit-btn.loading .btn-spinner { display: block; }
+  .submit-btn.loading .btn-text    { opacity: 0.7; }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Footer ── */
+  .login-footer {
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-muted);
+    padding-top: 4px;
+    border-top: 1px solid var(--border);
+  }
+
+  .db-dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--teal-400);
+    margin-right: 5px;
+    animation: pulse-dot 2s ease-in-out infinite;
+    vertical-align: middle;
+  }
+
+  @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.4} }
+</style>
+</head>
+<body>
+
+<div class="login-card">
+
+  <!-- Brand -->
+  <div class="brand">
+    <div class="brand-name">Sarthi</div>
+    <div class="brand-sub">Data Navigator</div>
+    <p class="brand-tagline">Sign in to explore your data with natural language.</p>
   </div>
-  <div class="sidebar-header">
+
+  <!-- Form -->
+  <form id="login-form" onsubmit="handleLogin(event)" autocomplete="on" novalidate>
+    <div class="form-fields">
+
+      <!-- Username / Email -->
+      <div class="form-group">
+        <label for="identifier">Username or Email</label>
+        <div class="input-wrap">
+          <span class="input-icon">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
+              <path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/>
+            </svg>
+          </span>
+          <input
+            type="text"
+            id="identifier"
+            name="identifier"
+            placeholder="Enter your username"
+            autocomplete="username"
+            required
+          />
+        </div>
+      </div>
+
+      <!-- Password -->
+      <div class="form-group">
+        <label for="password">Password</label>
+        <div class="input-wrap">
+          <span class="input-icon">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
+              <path d="M18 8h-1V6c0-2.8-2.2-5-5-5S7 3.2 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.7 1.4-3.1 3.1-3.1 1.7 0 3.1 1.4 3.1 3.1v2z"/>
+            </svg>
+          </span>
+          <input
+            type="password"
+            id="password"
+            name="password"
+            placeholder="Enter your password"
+            autocomplete="current-password"
+            required
+          />
+          <button type="button" class="pw-toggle" onclick="togglePw()" title="Show/hide password" tabindex="-1">
+            <svg id="pw-eye-open" viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
+              <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+            </svg>
+            <svg id="pw-eye-closed" viewBox="0 0 24 24" width="15" height="15" fill="currentColor" style="display:none">
+              <path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Error message -->
+      <div class="error-msg" id="error-msg">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+        </svg>
+        <span id="error-text">Incorrect username or password.</span>
+      </div>
+
+      <!-- Submit -->
+      <button type="submit" class="submit-btn" id="login-btn">
+        <div class="btn-spinner"></div>
+        <span class="btn-text">Sign in</span>
+      </button>
+
+    </div>
+  </form>
+
+  <!-- Footer -->
+  <div class="login-footer">
+    <span class="db-dot"></span>
+    Connected to FCI · Sarthi
+  </div>
+
+</div>
+
+<script>
+  const API_BASE = window.location.origin;
+
+  // ── Check session on load ─────────────────────────────────────────────────
+  // If already logged in, redirect to chat immediately
+  (async () => {
+    try {
+      const r = await fetch(`${API_BASE}/auth/me`);
+      if (r.ok) {
+        const d = await r.json();
+        if (d.status === 'success') {
+          window.location.href = '/chat';
+        }
+      }
+    } catch { /* not logged in */ }
+  })();
+
+  // ── Password visibility toggle ────────────────────────────────────────────
+  function togglePw() {
+    const inp    = document.getElementById('password');
+    const open   = document.getElementById('pw-eye-open');
+    const closed = document.getElementById('pw-eye-closed');
+    const show   = inp.type === 'password';
+    inp.type     = show ? 'text' : 'password';
+    open.style.display   = show ? 'none'  : '';
+    closed.style.display = show ? ''      : 'none';
+  }
+
+  // ── Error display ─────────────────────────────────────────────────────────
+  function showError(msg) {
+    const el   = document.getElementById('error-msg');
+    const text = document.getElementById('error-text');
+    text.textContent = msg;
+    el.classList.remove('show');
+    // Force reflow to retrigger shake animation
+    void el.offsetWidth;
+    el.classList.add('show');
+  }
+
+  function clearError() {
+    document.getElementById('error-msg').classList.remove('show');
+  }
+
+  // ── Login handler ─────────────────────────────────────────────────────────
+  async function handleLogin(e) {
+    e.preventDefault();
+    clearError();
+
+    const identifier = document.getElementById('identifier').value.trim();
+    const password   = document.getElementById('password').value.trim();
+    const btn        = document.getElementById('login-btn');
+
+    if (!identifier) { showError('Please enter your username or email.'); return; }
+    if (!password)   { showError('Please enter your password.'); return; }
+
+    // Loading state
+    btn.classList.add('loading');
+    btn.disabled = true;
+
+    try {
+      const resp = await fetch(`${API_BASE}/auth/login`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ identifier, password }),
+      });
+
+      const data = await resp.json();
+
+      if (resp.ok && data.status === 'success') {
+        // Redirect to chat
+        window.location.href = '/chat';
+      } else {
+        showError(data.message || 'Incorrect username or password.');
+      }
+    } catch {
+      showError('Cannot connect to server. Please try again.');
+    } finally {
+      btn.classList.remove('loading');
+      btn.disabled = false;
+    }
+  }
+
+  // Clear error when user starts typing
+  document.getElementById('identifier').addEventListener('input', clearError);
+  document.getElementById('password').addEventListener('input', clearError);
+</script>
+</body>
+</html>
