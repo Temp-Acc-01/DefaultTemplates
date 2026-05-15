@@ -1,953 +1,606 @@
+-- Token wallets: one row per user, tracks balance
+CREATE TABLE IF NOT EXISTS token_wallets (
+    user_id BIGINT PRIMARY KEY,  -- matches nlq_user_details.id or username lookup
+    total_allocated BIGINT NOT NULL DEFAULT 0,
+    total_used BIGINT NOT NULL DEFAULT 0,
+    available_tokens BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES nlq_user_details(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Token transactions: immutable audit ledger
+CREATE TABLE IF NOT EXISTS token_transactions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    type ENUM('ALLOCATE', 'RESERVE', 'DEDUCT', 'REFUND', 'ADJUST') NOT NULL,
+    tokens BIGINT NOT NULL,
+    request_id VARCHAR(128),          -- unique per API call (e.g., UUID)
+    model_name VARCHAR(64),           -- e.g., "gemini-2.5-pro"
+    balance_before BIGINT,
+    balance_after BIGINT,
+    metadata JSON,                    -- e.g., {"query": "top 5 customers", "attempt": 2}
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_user (user_id),
+    INDEX idx_request (request_id),
+    INDEX idx_created (created_at),
+    FOREIGN KEY (user_id) REFERENCES nlq_user_details(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+
+---------------------
+
+
 """
-token_manager.py  --  Sarthi Token Quota System
+token_manager.py -- Production Token Wallet System
 
-Responsibilities:
-  - Atomic token deduction from MySQL (race-condition safe)
-  - Balance fetch (always live from DB, never session-cached)
-  - Flask blueprint: /tokens/balance  /tokens/deduct
-  - Multi-device safe: all state in DB, no in-memory caching
-
-Table column used: api_tokens (TEXT or INT) in nlq_user_details
-  - NULL or missing = unlimited (admin accounts)
-  - 0 = exhausted
-  - N = N tokens remaining
-
-Integration:
-  1. from token_manager import register_tokens, get_balance, deduct_tokens
-  2. Call register_tokens(app) inside create_app() after register_auth(app)
-  3. Frontend: GET /tokens/balance  POST /tokens/deduct
+Design:
+- token_wallets: current balance per user (atomic updates)
+- token_transactions: immutable audit ledger
+- Reserve → Deduct → Refund flow for LLM queries
+- Atomic conditional UPDATE prevents race conditions
 """
 
+import os
 import logging
+import uuid
 import functools
 import pymysql
 import pymysql.cursors
 from flask import Blueprint, request, jsonify, session
+from datetime import datetime
+from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
-# Re-use same DB config as auth.py (read from env at import time)
+# Config (reuse auth DB settings)
 # ------------------------------------------------------------------
-import os
-
 MYSQL_HOST  = os.environ.get("AUTH_MYSQL_HOST",  "localhost")
 MYSQL_PORT  = int(os.environ.get("AUTH_MYSQL_PORT", 3306))
 MYSQL_USER  = os.environ.get("AUTH_MYSQL_USER",  "nabh")
 MYSQL_PASS  = os.environ.get("AUTH_MYSQL_PASS",  "nabh@2026")
 MYSQL_DB    = os.environ.get("AUTH_MYSQL_DB",    "NABH")
-TABLE_NAME  = "nlq_user_details"
+USER_TABLE  = "nlq_user_details"      # existing auth table
+WALLET_TABLE = "token_wallets"
+TXN_TABLE   = "token_transactions"
 
-WARN_THRESHOLD     = 25_000   # show warning below this
-CRITICAL_THRESHOLD = 0        # block below or equal to this
+# Thresholds
+WARN_THRESHOLD     = 25_000   # show warning when available <= this
+CRITICAL_THRESHOLD = 0        # block when available <= this
+DEFAULT_RESERVE    = 25_000   # reserve this much per query by default
+MAX_RESERVE        = 100_000  # hard cap on reserve amount
 
 
 # ------------------------------------------------------------------
-# DB helpers
+# DB Helpers
 # ------------------------------------------------------------------
 
 def _get_conn():
+    """Get a new MySQL connection."""
     return pymysql.connect(
-        host        = MYSQL_HOST,
-        port        = MYSQL_PORT,
-        user        = MYSQL_USER,
-        password    = MYSQL_PASS,
-        database    = MYSQL_DB,
-        cursorclass = pymysql.cursors.DictCursor,
-        connect_timeout = 10,
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASS,
+        database=MYSQL_DB,
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=10,
+        autocommit=False,  # we manage transactions manually
     )
 
 
-def get_balance(username: str) -> dict:
-    """
-    Returns {available, total, unlimited, warn, blocked}
-    Always reads live from DB -- safe for multi-device.
-
-    api_tokens column stores a string like "950000/1000000"
-    format: "available/total"
-    OR a plain integer string "1000000" (treated as available=total on first read)
-    OR NULL (unlimited)
-    """
-    try:
-        conn = _get_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT api_tokens FROM {TABLE_NAME} WHERE username = %s LIMIT 1",
-                (username,)
-            )
-            row = cur.fetchone()
-        conn.close()
-    except Exception as e:
-        logger.error("get_balance DB error: %s", e)
-        # Fail open -- don't block user on DB error
-        return {"available": 999999, "total": 999999, "unlimited": False,
-                "warn": False, "blocked": False, "error": str(e)}
-
-    if not row or row["api_tokens"] is None:
-        return {"available": None, "total": None, "unlimited": True,
-                "warn": False, "blocked": False}
-
-    raw = str(row["api_tokens"]).strip()
-
-    if "/" in raw:
-        parts     = raw.split("/", 1)
-        available = int(parts[0])
-        total     = int(parts[1])
-    else:
-        # Plain integer -- treat as available = total (initialise format)
-        available = int(raw)
-        total     = int(raw)
-        # Rewrite to standard format
-        _write_balance(username, available, total)
-
-    return {
-        "available": available,
-        "total":     total,
-        "unlimited": False,
-        "warn":      0 < available <= WARN_THRESHOLD,
-        "blocked":   available <= CRITICAL_THRESHOLD,
-    }
-
-
-def _write_balance(username: str, available: int, total: int) -> bool:
-    """Overwrite api_tokens with 'available/total' string."""
-    try:
-        conn = _get_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                f"UPDATE {TABLE_NAME} SET api_tokens = %s WHERE username = %s",
-                (f"{available}/{total}", username)
-            )
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        logger.error("_write_balance error: %s", e)
-        return False
-
-
-def deduct_tokens(username: str, amount: int) -> dict:
-    """
-    Atomically deduct `amount` tokens from user's balance.
-
-    Uses a single UPDATE with conditional WHERE so two simultaneous
-    requests from different devices cannot both succeed if balance
-    would go negative.
-
-    Returns:
-      {success, available, total, warn, blocked, message}
-    """
-    if amount <= 0:
-        bal = get_balance(username)
-        return {**bal, "success": True, "message": "No deduction needed"}
-
-    try:
-        conn = _get_conn()
-        with conn.cursor() as cur:
-            # Read current balance first
-            cur.execute(
-                f"SELECT api_tokens FROM {TABLE_NAME} WHERE username = %s LIMIT 1",
-                (username,)
-            )
-            row = cur.fetchone()
-
-        if not row or row["api_tokens"] is None:
-            conn.close()
-            # Unlimited user -- no deduction needed
-            return {"success": True, "available": None, "total": None,
-                    "unlimited": True, "warn": False, "blocked": False,
-                    "message": "Unlimited"}
-
-        raw = str(row["api_tokens"]).strip()
-        if "/" in raw:
-            parts     = raw.split("/", 1)
-            available = int(parts[0])
-            total     = int(parts[1])
-        else:
-            available = int(raw)
-            total     = int(raw)
-
-        if available <= 0:
-            conn.close()
-            return {"success": False, "available": 0, "total": total,
-                    "unlimited": False, "warn": False, "blocked": True,
-                    "message": "Token quota exhausted. Please contact admin to recharge."}
-
-        # Atomic deduction -- clamp to 0, never negative
-        new_available = max(0, available - amount)
-        new_raw       = f"{new_available}/{total}"
-
-        with conn.cursor() as cur:
-            affected = cur.execute(
-                f"""UPDATE {TABLE_NAME}
-                    SET api_tokens = %s
-                    WHERE username = %s
-                      AND api_tokens = %s""",
-                (new_raw, username, raw)
-            )
-        conn.commit()
-        conn.close()
-
-        if affected == 0:
-            # Concurrent update -- re-read and return current state
-            logger.warning("Concurrent token deduction detected for '%s' -- re-reading", username)
-            bal = get_balance(username)
-            return {**bal, "success": True, "message": "Concurrent update -- balance refreshed"}
-
-        warn    = 0 < new_available <= WARN_THRESHOLD
-        blocked = new_available <= CRITICAL_THRESHOLD
-
-        logger.info("Deducted %d tokens for '%s': %d -> %d / %d",
-                    amount, username, available, new_available, total)
-
-        return {
-            "success":   True,
-            "available": new_available,
-            "total":     total,
-            "unlimited": False,
-            "warn":      warn,
-            "blocked":   blocked,
-            "message":   "OK",
-        }
-
-    except Exception as e:
-        logger.error("deduct_tokens error for '%s': %s", username, e)
-        return {"success": False, "available": None, "total": None,
-                "unlimited": False, "warn": False, "blocked": False,
-                "error": str(e), "message": "DB error during deduction"}
-
-
-# ------------------------------------------------------------------
-# login_required re-used from auth session
-# ------------------------------------------------------------------
-
-def _session_username():
-    """Extract username from Flask session. Returns None if not logged in."""
+def _get_username() -> Optional[str]:
+    """Get current username from Flask session."""
     return session.get("username")
 
 
-def token_login_required(f):
-    @functools.wraps(f)
-    def decorated(*args, **kwargs):
-        if not _session_username():
-            return jsonify({"status": "error", "message": "Not authenticated"}), 401
-        return f(*args, **kwargs)
-    return decorated
+def _ensure_wallet(username: str, conn) -> None:
+    """Create wallet row if it doesn't exist (idempotent)."""
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            INSERT INTO {WALLET_TABLE} (user_id, total_allocated, total_used, available_tokens)
+            SELECT %s, 0, 0, 0
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {WALLET_TABLE} WHERE user_id = %s
+            )
+        """, (username, username))
+    # Do NOT commit here — caller manages transaction
+
+
+def _log_transaction(
+    conn,
+    username: str,
+    txn_type: str,
+    tokens: int,
+    request_id: Optional[str] = None,
+    model_name: Optional[str] = None,
+    balance_before: Optional[int] = None,
+    balance_after: Optional[int] = None,
+    metadata: Optional[Dict] = None,
+) -> None:
+    """Insert an immutable transaction record."""
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            INSERT INTO {TXN_TABLE} (
+                user_id, type, tokens, request_id, model_name,
+                balance_before, balance_after, metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            username, txn_type, tokens, request_id, model_name,
+            balance_before, balance_after, metadata
+        ))
+
+
+def get_wallet(username: str) -> Dict[str, Any]:
+    """
+    Get current wallet state for a user.
+    Returns: {available, total_allocated, total_used, warn, blocked}
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT available_tokens, total_allocated, total_used
+                FROM {WALLET_TABLE}
+                WHERE user_id = %s LIMIT 1
+            """, (username,))
+            row = cur.fetchone()
+        
+        if not row:
+            # Wallet doesn't exist yet — treat as zero balance
+            return {
+                "available": 0,
+                "total_allocated": 0,
+                "total_used": 0,
+                "warn": False,
+                "blocked": True,
+            }
+        
+        available = row["available_tokens"] or 0
+        allocated = row["total_allocated"] or 0
+        used = row["total_used"] or 0
+        
+        return {
+            "available": available,
+            "total_allocated": allocated,
+            "total_used": used,
+            "warn": 0 < available <= WARN_THRESHOLD,
+            "blocked": available <= CRITICAL_THRESHOLD,
+        }
+    finally:
+        conn.close()
+
+
+def allocate_tokens(username: str, amount: int, request_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Admin operation: add tokens to a user's wallet.
+    Atomic: updates wallet + logs transaction in single transaction.
+    """
+    if amount <= 0:
+        return {"success": False, "message": "Amount must be positive"}
+    
+    conn = _get_conn()
+    try:
+        with conn:  # transaction context
+            _ensure_wallet(username, conn)
+            
+            # Read current balance
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT available_tokens FROM {WALLET_TABLE}
+                    WHERE user_id = %s FOR UPDATE
+                """, (username,))
+                row = cur.fetchone()
+                balance_before = row["available_tokens"] if row else 0
+            
+            # Update wallet
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    UPDATE {WALLET_TABLE}
+                    SET total_allocated = total_allocated + %s,
+                        available_tokens = available_tokens + %s,
+                        updated_at = NOW()
+                    WHERE user_id = %s
+                """, (amount, amount, username))
+            
+            balance_after = (balance_before or 0) + amount
+            
+            # Log transaction
+            _log_transaction(
+                conn, username, "ALLOCATE", amount,
+                request_id=request_id,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                metadata={"admin_action": True}
+            )
+        
+        return {
+            "success": True,
+            "available": balance_after,
+            "total_allocated": (balance_before or 0) + amount,
+            "message": f"Allocated {amount:,} tokens"
+        }
+    except Exception as e:
+        logger.error("allocate_tokens error: %s", e)
+        return {"success": False, "message": f"DB error: {e}"}
+    finally:
+        conn.close()
+
+
+def reserve_tokens(
+    username: str,
+    amount: int,
+    request_id: str,
+    model_name: Optional[str] = None,
+    metadata: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    """
+    Reserve tokens for an LLM query (pre-authorization).
+    Atomic conditional update: only succeeds if sufficient balance.
+    Reserved tokens are still "available" but earmarked — we track via transaction log.
+    
+    Note: We don't physically move tokens to a "reserved" column.
+    Instead, we log a RESERVE transaction and rely on the subsequent
+    DEDUCT/REFUND to finalize. This keeps the wallet simple.
+    """
+    if amount <= 0:
+        return {"success": True, "reserved": 0, "message": "No reserve needed"}
+    
+    conn = _get_conn()
+    try:
+        with conn:  # transaction
+            _ensure_wallet(username, conn)
+            
+            # Atomic conditional update
+            with conn.cursor() as cur:
+                affected = cur.execute(f"""
+                    UPDATE {WALLET_TABLE}
+                    SET available_tokens = available_tokens - %s,
+                        updated_at = NOW()
+                    WHERE user_id = %s AND available_tokens >= %s
+                """, (amount, username, amount))
+            
+            if affected == 0:
+                # Insufficient balance
+                current = get_wallet(username)
+                return {
+                    "success": False,
+                    "available": current["available"],
+                    "blocked": True,
+                    "message": f"Insufficient balance. Need {amount:,}, have {current['available']:,}"
+                }
+            
+            # Read new balance
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT available_tokens FROM {WALLET_TABLE}
+                    WHERE user_id = %s
+                """, (username,))
+                row = cur.fetchone()
+                balance_after = row["available_tokens"]
+            
+            balance_before = balance_after + amount
+            
+            # Log RESERVE transaction
+            _log_transaction(
+                conn, username, "RESERVE", amount,
+                request_id=request_id,
+                model_name=model_name,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                metadata=metadata or {}
+            )
+        
+        return {
+            "success": True,
+            "reserved": amount,
+            "available": balance_after,
+            "message": "Reserved"
+        }
+    except Exception as e:
+        logger.error("reserve_tokens error: %s", e)
+        return {"success": False, "message": f"DB error: {e}"}
+    finally:
+        conn.close()
+
+
+def finalize_usage(
+    username: str,
+    request_id: str,
+    actual_used: int,
+    reserved_amount: int,
+    model_name: Optional[str] = None,
+    metadata: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    """
+    After LLM response: deduct actual usage, refund the rest.
+    Two atomic operations in one transaction.
+    """
+    if actual_used < 0:
+        return {"success": False, "message": "Invalid token count"}
+    
+    conn = _get_conn()
+    try:
+        with conn:  # transaction
+            _ensure_wallet(username, conn)
+            
+            # Read current balance
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT available_tokens FROM {WALLET_TABLE}
+                    WHERE user_id = %s FOR UPDATE
+                """, (username,))
+                row = cur.fetchone()
+                current_avail = row["available_tokens"] if row else 0
+            
+            refund = max(0, reserved_amount - actual_used)
+            to_deduct = actual_used  # net deduction from reserved pool
+            
+            # If reserved > actual, we refund the difference back to available
+            if refund > 0:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        UPDATE {WALLET_TABLE}
+                        SET available_tokens = available_tokens + %s,
+                            updated_at = NOW()
+                        WHERE user_id = %s
+                    """, (refund, username))
+                # Log REFUND
+                _log_transaction(
+                    conn, username, "REFUND", refund,
+                    request_id=request_id,
+                    model_name=model_name,
+                    balance_before=current_avail,
+                    balance_after=current_avail + refund,
+                    metadata={**(metadata or {}), "reserved": reserved_amount}
+                )
+                current_avail += refund
+            
+            # Log the final DEDUCT for actual usage
+            _log_transaction(
+                conn, username, "DEDUCT", actual_used,
+                request_id=request_id,
+                model_name=model_name,
+                balance_before=current_avail,
+                balance_after=current_avail - actual_used,
+                metadata={**(metadata or {}), "reserved": reserved_amount}
+            )
+            
+            # Update total_used counter
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    UPDATE {WALLET_TABLE}
+                    SET total_used = total_used + %s,
+                        updated_at = NOW()
+                    WHERE user_id = %s
+                """, (actual_used, username))
+        
+        new_wallet = get_wallet(username)
+        return {
+            "success": True,
+            "actual_used": actual_used,
+            "refunded": refund,
+            "available": new_wallet["available"],
+            "total_used": new_wallet["total_used"],
+            "message": "Finalized"
+        }
+    except Exception as e:
+        logger.error("finalize_usage error: %s", e)
+        return {"success": False, "message": f"DB error: {e}"}
+    finally:
+        conn.close()
+
+
+def deduct_tokens_immediate(
+    username: str,
+    amount: int,
+    request_id: Optional[str] = None,
+    model_name: Optional[str] = None,
+    metadata: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    """
+    Simple deduct (no reserve) for non-LLM operations.
+    Atomic conditional update.
+    """
+    if amount <= 0:
+        return {"success": True, "message": "No deduction needed"}
+    
+    conn = _get_conn()
+    try:
+        with conn:
+            _ensure_wallet(username, conn)
+            
+            with conn.cursor() as cur:
+                affected = cur.execute(f"""
+                    UPDATE {WALLET_TABLE}
+                    SET available_tokens = available_tokens - %s,
+                        total_used = total_used + %s,
+                        updated_at = NOW()
+                    WHERE user_id = %s AND available_tokens >= %s
+                """, (amount, amount, username, amount))
+            
+            if affected == 0:
+                current = get_wallet(username)
+                return {
+                    "success": False,
+                    "available": current["available"],
+                    "blocked": True,
+                    "message": f"Insufficient balance"
+                }
+            
+            # Read new balance
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT available_tokens, total_used FROM {WALLET_TABLE}
+                    WHERE user_id = %s
+                """, (username,))
+                row = cur.fetchone()
+            
+            _log_transaction(
+                conn, username, "DEDUCT", amount,
+                request_id=request_id,
+                model_name=model_name,
+                balance_before=(row["available_tokens"] or 0) + amount,
+                balance_after=row["available_tokens"],
+                metadata=metadata or {}
+            )
+        
+        return {
+            "success": True,
+            "available": row["available_tokens"],
+            "total_used": row["total_used"],
+            "message": "Deducted"
+        }
+    except Exception as e:
+        logger.error("deduct_tokens_immediate error: %s", e)
+        return {"success": False, "message": f"DB error: {e}"}
+    finally:
+        conn.close()
+
+
+def get_transaction_history(username: str, limit: int = 50) -> list:
+    """Get recent transactions for a user (for audit/debug)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT id, type, tokens, request_id, model_name,
+                       balance_before, balance_after, metadata, created_at
+                FROM {TXN_TABLE}
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (username, limit))
+            return cur.fetchall()
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------
-# Flask Blueprint
+# Flask Blueprint & Routes
 # ------------------------------------------------------------------
 
 tokens_bp = Blueprint("tokens", __name__)
 
 
-@tokens_bp.route("/tokens/balance", methods=["GET"])
-@token_login_required
-def balance_route():
-    """
-    GET /tokens/balance
-    Returns current token balance for the logged-in user.
-    Always reads live from DB.
-
-    Response:
-    {
-      "status": "success",
-      "available": 950000,
-      "total": 1000000,
-      "unlimited": false,
-      "warn": false,
-      "blocked": false
-    }
-    """
-    username = _session_username()
-    bal      = get_balance(username)
-    return jsonify({"status": "success", **bal})
-
-
-@tokens_bp.route("/tokens/deduct", methods=["POST"])
-@token_login_required
-def deduct_route():
-    """
-    POST /tokens/deduct
-    Body: { "amount": 12345 }
-
-    Atomically deducts tokens from the user's balance.
-    Returns updated balance state.
-
-    Response:
-    {
-      "status": "success",
-      "available": 937655,
-      "total": 1000000,
-      "unlimited": false,
-      "warn": false,
-      "blocked": false,
-      "message": "OK"
-    }
-    """
-    username = _session_username()
-    body     = request.get_json(silent=True) or {}
-    amount   = int(body.get("amount") or 0)
-
-    result = deduct_tokens(username, amount)
-
-    status_code = 200
-    if not result.get("success") and result.get("blocked"):
-        status_code = 402  # Payment Required -- quota exhausted
-
-    return jsonify({"status": "success" if result.get("success") else "error",
-                    **result}), status_code
-
-
-# ------------------------------------------------------------------
-# Registration helper
-# ------------------------------------------------------------------
-
-def register_tokens(app):
-    """
-    Call inside create_app() after register_auth(app).
-
-    from token_manager import register_tokens
-    register_tokens(app)
-    """
-    app.register_blueprint(tokens_bp)
-    logger.info("Token manager registered. Warn threshold: %d, Block threshold: %d",
-                WARN_THRESHOLD, CRITICAL_THRESHOLD)
-
-
-
-
-------------------
-
-
-
-"""
-auth.py  --  Sarthi Authentication Module
-
-Changes from previous version:
-  - Passwords stored and compared as PLAIN TEXT (no bcrypt)
-  - /auth/me now returns api_tokens field for frontend quota display
-  - login_required decorator unchanged
-"""
-
-import os
-import logging
-import functools
-import pymysql
-import pymysql.cursors
-
-from flask import (
-    Blueprint, request, jsonify, session,
-    redirect, url_for, make_response,
-)
-
-logger = logging.getLogger(__name__)
-
-# ------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------
-MYSQL_HOST   = os.environ.get("AUTH_MYSQL_HOST",   "localhost")
-MYSQL_PORT   = int(os.environ.get("AUTH_MYSQL_PORT", 3306))
-MYSQL_USER   = os.environ.get("AUTH_MYSQL_USER",   "nabh")
-MYSQL_PASS   = os.environ.get("AUTH_MYSQL_PASS",   "nabh@2026")
-MYSQL_DB     = os.environ.get("AUTH_MYSQL_DB",     "NABH")
-TABLE_NAME   = "nlq_user_details"
-
-SESSION_SECRET = os.environ.get("SESSION_SECRET", "sarthi-secret-change-in-prod-2026")
-
-
-# ------------------------------------------------------------------
-# DB helpers
-# ------------------------------------------------------------------
-
-def _get_conn():
-    return pymysql.connect(
-        host        = MYSQL_HOST,
-        port        = MYSQL_PORT,
-        user        = MYSQL_USER,
-        password    = MYSQL_PASS,
-        database    = MYSQL_DB,
-        cursorclass = pymysql.cursors.DictCursor,
-        connect_timeout = 10,
-    )
-
-
-def ensure_table():
-    """
-    Create nlq_user_details if it doesn't exist.
-    Password column stores PLAIN TEXT.
-    api_tokens stores quota as "available/total" string e.g. "950000/1000000"
-    or NULL for unlimited users.
-    """
-    ddl = f"""
-    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-        id          INT AUTO_INCREMENT PRIMARY KEY,
-        username    VARCHAR(120) NOT NULL UNIQUE,
-        password    VARCHAR(255) NOT NULL,
-        api_tokens  TEXT         DEFAULT NULL,
-        created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """
-    try:
-        conn = _get_conn()
-        with conn.cursor() as cur:
-            cur.execute(ddl)
-        conn.commit()
-        conn.close()
-        logger.info("Auth table '%s' ready.", TABLE_NAME)
-    except Exception as e:
-        logger.error("Could not ensure auth table: %s", e)
-
-
-def _lookup_user(identifier: str):
-    """
-    Find user by username.
-    Returns dict with {username, password, api_tokens} or None.
-    """
-    try:
-        conn = _get_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT username, password, api_tokens "
-                f"FROM {TABLE_NAME} WHERE username = %s LIMIT 1",
-                (identifier,)
-            )
-            row = cur.fetchone()
-        conn.close()
-        return row
-    except Exception as e:
-        logger.error("DB lookup failed: %s", e)
-        return None
-
-
-def _verify_password(plain: str, stored: str) -> bool:
-    """
-    Plain text comparison.
-    Both plain and stored are compared as-is (stripped).
-    """
-    return plain.strip() == stored.strip()
-
-
-# ------------------------------------------------------------------
-# Blueprint
-# ------------------------------------------------------------------
-
-auth_bp = Blueprint("auth", __name__)
-
-
-@auth_bp.route("/auth/login", methods=["POST"])
-def login():
-    """
-    POST /auth/login
-    Body: { "identifier": "username", "password": "..." }
-    Returns: { "status": "success", "username": "..." }
-    """
-    body       = request.get_json(silent=True) or {}
-    identifier = (body.get("identifier") or "").strip()
-    password   = (body.get("password")   or "").strip()
-
-    if not identifier or not password:
-        return jsonify({"status": "error",
-                        "message": "Username and password are required."}), 400
-
-    user = _lookup_user(identifier)
-
-    if not user:
-        return jsonify({"status": "error",
-                        "message": "Incorrect username or password."}), 401
-
-    if not _verify_password(password, user["password"]):
-        return jsonify({"status": "error",
-                        "message": "Incorrect username or password."}), 401
-
-    session.permanent  = True
-    session["username"] = user["username"]
-    logger.info("User '%s' logged in.", user["username"])
-
-    return jsonify({"status": "success", "username": user["username"]})
-
-
-@auth_bp.route("/auth/logout", methods=["POST"])
-def logout():
-    """POST /auth/logout -- clears session."""
-    username = session.pop("username", None)
-    if username:
-        logger.info("User '%s' logged out.", username)
-    return jsonify({"status": "success"})
-
-
-@auth_bp.route("/auth/me", methods=["GET"])
-def me():
-    """
-    GET /auth/me
-    Returns current user info including api_tokens for quota display.
-
-    Response:
-    {
-      "status": "success",
-      "username": "john",
-      "api_tokens": "950000/1000000"   <- raw string, frontend parses
-    }
-    """
-    if "username" not in session:
-        return jsonify({"status": "error", "message": "Not authenticated."}), 401
-
-    username = session["username"]
-
-    # Always read fresh api_tokens from DB so multi-device stays in sync
-    user = _lookup_user(username)
-    api_tokens_raw = user["api_tokens"] if user else None
-
-    return jsonify({
-        "status":     "success",
-        "username":   username,
-        "api_tokens": api_tokens_raw,   # "available/total" or None
-    })
-
-
-# ------------------------------------------------------------------
-# login_required decorator
-# ------------------------------------------------------------------
-
-def login_required(f):
-    """
-    Decorator for Flask route functions.
-    If session has no username, returns 401 JSON for API routes
-    or redirects to / for browser routes.
-    """
+def token_login_required(f):
+    """Decorator: require authenticated session."""
     @functools.wraps(f)
     def decorated(*args, **kwargs):
-        if "username" not in session:
-            if (request.is_json or
-                    request.path.startswith(("/query", "/generate", "/execute",
-                                             "/tables", "/upload", "/download",
-                                             "/chart", "/health", "/tokens"))):
-                return jsonify({"status": "error",
-                                "message": "Not authenticated."}), 401
-            return redirect("/")
+        if not _get_username():
+            return jsonify({"status": "error", "message": "Not authenticated"}), 401
         return f(*args, **kwargs)
     return decorated
 
 
-# ------------------------------------------------------------------
-# Registration helper
-# ------------------------------------------------------------------
+@tokens_bp.route("/tokens/balance", methods=["GET"])
+@token_login_required
+def balance_route():
+    """GET /tokens/balance — current wallet state."""
+    username = _get_username()
+    wallet = get_wallet(username)
+    return jsonify({"status": "success", **wallet})
 
-def register_auth(app):
+
+@tokens_bp.route("/tokens/reserve", methods=["POST"])
+@token_login_required
+def reserve_route():
     """
-    Call inside create_app() BEFORE registering other routes.
-    Sets secret key, registers auth blueprint, ensures DB table exists.
+    POST /tokens/reserve
+    Body: { "amount": 25000, "request_id": "uuid", "model_name": "gemini-2.5-pro" }
+    Reserve tokens before calling LLM.
     """
-    app.secret_key = SESSION_SECRET
-    app.register_blueprint(auth_bp)
-    ensure_table()
-    logger.info("Auth module registered (plain-text passwords).")
-
-
-
-
-
-
-
-
-
--------------------
-
-
-APP.PY -- EXACT CHANGES NEEDED (2 edits only)
-=============================================
-
-EDIT 1 -- Add import at the top of app.py
-------------------------------------------
-Find this line (already there):
-    from auth import register_auth, login_required
-
-Add ONE line directly below it:
-    from token_manager import register_tokens
-
-
-EDIT 2 -- Register the blueprint inside create_app()
-------------------------------------------------------
-Find this block (already there):
-    pipeline = NL2SQLPipeline()
-
-Add ONE line directly above it:
-    register_tokens(app)
-
-So the block becomes:
-    register_tokens(app)
-    pipeline = NL2SQLPipeline()
-
-
-That's it for app.py. Nothing else changes.
-The /tokens/balance and /tokens/deduct routes are handled entirely
-inside token_manager.py via the Blueprint.
-
-
-
----------------
-
-
-SARTHI_INDEX.HTML -- TOKEN QUOTA PATCHES
-=========================================
-Apply these 4 patches in order.
-
-
-===========================================================
-PATCH 1 -- Add token quota CSS  (inside <style>, at the end before closing </style>)
-===========================================================
-
-FIND:
-  .user-meta-row {
-    display: flex; align-items: center; gap: 4px;
-    justify-content: flex-end;
-  }
-
-REPLACE WITH:
-  .user-meta-row {
-    display: flex; align-items: center; gap: 4px;
-    justify-content: flex-end;
-  }
-
-  /* -- Token quota widget -- */
-  .token-quota-wrap {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-shrink: 0;
-  }
-
-  .token-quota-badge {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    padding: 3px 10px;
-    border-radius: 20px;
-    font-size: 11px;
-    font-weight: 600;
-    font-family: 'DM Sans', sans-serif;
-    border: 1px solid rgba(100,130,180,0.22);
-    background: var(--slate-50);
-    color: var(--slate-900);
-    letter-spacing: 0.1px;
-    cursor: default;
-    transition: background 0.2s, border-color 0.2s, color 0.2s;
-    white-space: nowrap;
-  }
-
-  .token-quota-badge .tq-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--teal-400);
-    flex-shrink: 0;
-    transition: background 0.2s;
-  }
-
-  .token-quota-badge.tq-warn {
-    background: #FFF8EC;
-    border-color: #F6C96B;
-    color: #7A4F00;
-  }
-  .token-quota-badge.tq-warn .tq-dot { background: #F6A623; }
-
-  .token-quota-badge.tq-blocked {
-    background: #FFF2F2;
-    border-color: #F2CACA;
-    color: #9B4040;
-  }
-  .token-quota-badge.tq-blocked .tq-dot { background: #D94F4F; animation: pulse-dot 1.2s ease-in-out infinite; }
-
-  /* Quota exhausted overlay on input area */
-  .quota-blocked-notice {
-    display: none;
-    align-items: center;
-    gap: 8px;
-    padding: 9px 16px;
-    background: #FFF2F2;
-    border: 1px solid #F2CACA;
-    border-radius: var(--radius-md);
-    font-size: 12.5px;
-    color: #9B4040;
-    margin-bottom: 8px;
-    animation: fadeUp 0.2s ease;
-  }
-  .quota-blocked-notice.visible { display: flex; }
-  .quota-blocked-notice svg { flex-shrink: 0; }
-
-  /* Warn toast -- appears inline above input */
-  .quota-warn-toast {
-    display: none;
-    align-items: center;
-    gap: 8px;
-    padding: 7px 14px;
-    background: #FFF8EC;
-    border: 1px solid #F6C96B;
-    border-radius: var(--radius-md);
-    font-size: 12px;
-    color: #7A4F00;
-    margin-bottom: 6px;
-    animation: fadeUp 0.2s ease;
-  }
-  .quota-warn-toast.visible { display: flex; }
-
-
-===========================================================
-PATCH 2 -- Add token quota widget HTML in topbar
-===========================================================
-
-FIND (in the topbar div, the existing tables badge span):
-    <span class="topbar-badge" id="tables-badge">Loading...</span>
-
-REPLACE WITH:
-    <!-- Token quota display -->
-    <div class="token-quota-wrap" id="token-quota-wrap" style="display:none">
-      <div class="token-quota-badge" id="token-quota-badge">
-        <div class="tq-dot" id="tq-dot"></div>
-        <span id="tq-label">-- / --</span>
-      </div>
-    </div>
-
-    <span class="topbar-badge" id="tables-badge">Loading...</span>
-
-
-===========================================================
-PATCH 3 -- Add quota notices above input area
-===========================================================
-
-FIND (the input-area div, right before the input-wrap div):
-    <div class="input-area">
-      <div class="input-wrap">
-
-REPLACE WITH:
-    <div class="input-area">
-      <!-- Quota exhausted notice -->
-      <div class="quota-blocked-notice" id="quota-blocked-notice">
-        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
-          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
-        </svg>
-        <span>Your token quota is exhausted. Please contact the admin to recharge your quota.</span>
-      </div>
-      <!-- Low quota warning toast -->
-      <div class="quota-warn-toast" id="quota-warn-toast">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
-          <path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/>
-        </svg>
-        <span id="quota-warn-text">Token quota is running low. Only a few queries remaining.</span>
-      </div>
-      <div class="input-wrap">
-
-
-===========================================================
-PATCH 4 -- Add JS token logic (add inside <script>, right after the existing loadHealth function)
-===========================================================
-
-FIND:
-  async function loadHealth() {
-    try {
-      const r = await fetch(`${API_BASE}/health`);
-      const d = await r.json();
-      document.getElementById('tables-badge').textContent = `${d.tables_loaded} tables loaded`;
-    } catch {
-      document.getElementById('tables-badge').style.display = 'none';
-      document.getElementById('db-status-text').textContent = 'Connecting...';
-    }
-  }
-
-REPLACE WITH:
-  async function loadHealth() {
-    try {
-      const r = await fetch(`${API_BASE}/health`);
-      const d = await r.json();
-      document.getElementById('tables-badge').textContent = `${d.tables_loaded} tables loaded`;
-    } catch {
-      document.getElementById('tables-badge').style.display = 'none';
-      document.getElementById('db-status-text').textContent = 'Connecting...';
-    }
-  }
-
-  // ----------------------------------------------------------------
-  // TOKEN QUOTA SYSTEM
-  // ----------------------------------------------------------------
-
-  let _quotaState = {
-    available: null,
-    total:     null,
-    unlimited: false,
-    warn:      false,
-    blocked:   false,
-  };
-
-  function _fmtTokens(n) {
-    if (n === null || n === undefined) return '--';
-    if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
-    if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'K';
-    return n.toLocaleString();
-  }
-
-  function _applyQuotaUI(state) {
-    _quotaState = state;
-
-    const wrap  = document.getElementById('token-quota-wrap');
-    const badge = document.getElementById('token-quota-badge');
-    const dot   = document.getElementById('tq-dot');
-    const label = document.getElementById('tq-label');
-    const blockedNotice = document.getElementById('quota-blocked-notice');
-    const warnToast     = document.getElementById('quota-warn-toast');
-    const sendBtn       = document.getElementById('send-btn');
-
-    if (!wrap) return;
-
-    if (state.unlimited) {
-      wrap.style.display = 'none';
-      return;
-    }
-
-    wrap.style.display = 'flex';
-
-    const avail = state.available ?? 0;
-    const total = state.total     ?? 0;
-
-    label.textContent = `${_fmtTokens(avail)} / ${_fmtTokens(total)}`;
-
-    // Badge state
-    badge.classList.remove('tq-warn', 'tq-blocked');
-    if (state.blocked) {
-      badge.classList.add('tq-blocked');
-    } else if (state.warn) {
-      badge.classList.add('tq-warn');
-    }
-
-    // Blocked notice + send disable
-    if (state.blocked) {
-      blockedNotice.classList.add('visible');
-      warnToast.classList.remove('visible');
-      if (sendBtn) sendBtn.disabled = true;
-    } else {
-      blockedNotice.classList.remove('visible');
-      if (sendBtn && !isLoading) sendBtn.disabled = false;
-
-      if (state.warn) {
-        // Show how many tokens remain
-        const warnText = document.getElementById('quota-warn-text');
-        if (warnText) {
-          warnText.textContent =
-            `Low token quota: ${_fmtTokens(avail)} remaining. Contact admin to recharge.`;
-        }
-        warnToast.classList.add('visible');
-      } else {
-        warnToast.classList.remove('visible');
-      }
-    }
-  }
-
-  async function fetchQuotaBalance() {
-    try {
-      const r = await fetch(`${API_BASE}/tokens/balance`);
-      if (!r.ok) return;
-      const d = await r.json();
-      if (d.status === 'success') _applyQuotaUI(d);
-    } catch (e) {
-      console.warn('Token balance fetch failed:', e);
-    }
-  }
-
-  async function deductQuota(amount) {
-    if (!amount || amount <= 0) return;
-    if (_quotaState.unlimited) return;
-    try {
-      const r = await fetch(`${API_BASE}/tokens/deduct`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ amount }),
-      });
-      const d = await r.json();
-      if (d.status === 'success' || d.available !== undefined) {
-        _applyQuotaUI(d);
-      }
-    } catch (e) {
-      console.warn('Token deduction failed:', e);
-    }
-  }
-
-  // Override sendQuery to check quota before submitting
-  const _origSendQuery = sendQuery;
-  sendQuery = async function() {
-    // Hard block if quota exhausted
-    if (_quotaState.blocked && !_quotaState.unlimited) {
-      // Re-show blocked notice in case it was hidden
-      const n = document.getElementById('quota-blocked-notice');
-      if (n) {
-        n.classList.add('visible');
-        n.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      }
-      return;
-    }
-    return _origSendQuery();
-  };
-
-
-===========================================================
-PATCH 5 -- Wire deduction in the 'done' SSE event handler
-===========================================================
-
-FIND (inside the 'done' case in the switch statement):
-          case 'done': {
-            removeProcessingBar();
-            fetchDone = true;
-            const totalTokens = payload.total_tokens ?? null;
-            addOrReplaceTimestamp(totalTokens);
-
-REPLACE WITH:
-          case 'done': {
-            removeProcessingBar();
-            fetchDone = true;
-            const totalTokens = payload.total_tokens ?? null;
-            addOrReplaceTimestamp(totalTokens);
-
-            // Deduct tokens from quota atomically after each query
-            if (totalTokens && totalTokens > 0) {
-              deductQuota(totalTokens);   // async, non-blocking
-            }
-
-
-===========================================================
-PATCH 6 -- Wire fetchQuotaBalance into the init block at the bottom
-===========================================================
-
-FIND (the last two lines before </script>):
-  // Init
-  newChat();
-  loadHealth();
-
-REPLACE WITH:
-  // Init
-  newChat();
-  loadHealth();
-  fetchQuotaBalance();   // load token quota on page open
-
-
-===========================================================
-SUMMARY OF ALL FILES TO CHANGE
-===========================================================
-
-NEW FILE:   token_manager.py    --> place next to app.py
-REPLACE:    auth.py             --> use the new auth.py (plain passwords, api_tokens in /auth/me)
-MODIFY:     app.py              --> 2 lines (see APP_PY_DIFF.txt)
-MODIFY:     sarthi_index.html   --> 6 patches above
-
-DB column format for api_tokens:
-  NULL                  = unlimited (admin)
-  "1000000/1000000"     = fresh 1M quota
-  "750000/1000000"      = 250K used, 750K left
-  Plain int "1000000"   = auto-converted to "1000000/1000000" on first read
-
-To add a user manually via MySQL:
-  INSERT INTO nlq_user_details (username, password, api_tokens)
-  VALUES ('john', 'plainpassword123', '1000000/1000000');
-
-To top up a user:
-  UPDATE nlq_user_details
-  SET api_tokens = '1000000/1000000'
-  WHERE username = 'john';
+    username = _get_username()
+    body = request.get_json(silent=True) or {}
+    
+    result = reserve_tokens(
+        username=username,
+        amount=int(body.get("amount") or DEFAULT_RESERVE),
+        request_id=body.get("request_id") or str(uuid.uuid4()),
+        model_name=body.get("model_name"),
+        metadata=body.get("metadata"),
+    )
+    
+    status = 200 if result["success"] else (402 if result.get("blocked") else 400)
+    return jsonify({"status": "success" if result["success"] else "error", **result}), status
+
+
+@tokens_bp.route("/tokens/finalize", methods=["POST"])
+@token_login_required
+def finalize_route():
+    """
+    POST /tokens/finalize
+    Body: { "request_id": "uuid", "actual_used": 3200, "reserved_amount": 25000 }
+    Call after LLM response to deduct actual + refund remainder.
+    """
+    username = _get_username()
+    body = request.get_json(silent=True) or {}
+    
+    result = finalize_usage(
+        username=username,
+        request_id=body.get("request_id"),
+        actual_used=int(body.get("actual_used") or 0),
+        reserved_amount=int(body.get("reserved_amount") or 0),
+        model_name=body.get("model_name"),
+        metadata=body.get("metadata"),
+    )
+    
+    status = 200 if result["success"] else 400
+    return jsonify({"status": "success" if result["success"] else "error", **result}), status
+
+
+@tokens_bp.route("/tokens/history", methods=["GET"])
+@token_login_required
+def history_route():
+    """GET /tokens/history — recent transactions for audit."""
+    username = _get_username()
+    limit = min(int(request.args.get("limit") or 50), 200)
+    txns = get_transaction_history(username, limit)
+    return jsonify({"status": "success", "transactions": txns})
+
+
+# Admin-only route: allocate tokens to any user
+@tokens_bp.route("/tokens/admin/allocate", methods=["POST"])
+@token_login_required
+def admin_allocate_route():
+    """
+    POST /tokens/admin/allocate
+    Body: { "target_user": "username", "amount": 100000 }
+    Requires: session user must be in ADMIN_USERS list (configurable).
+    """
+    ADMIN_USERS = os.environ.get("TOKEN_ADMIN_USERS", "admin,superuser").split(",")
+    current_user = _get_username()
+    
+    if current_user not in ADMIN_USERS:
+        return jsonify({"status": "error", "message": "Admin access required"}), 403
+    
+    body = request.get_json(silent=True) or {}
+    target = body.get("target_user", "").strip()
+    amount = int(body.get("amount") or 0)
+    
+    if not target or amount <= 0:
+        return jsonify({"status": "error", "message": "target_user and positive amount required"}), 400
+    
+    result = allocate_tokens(
+        username=target,
+        amount=amount,
+        request_id=f"admin_{current_user}_{uuid.uuid4().hex[:8]}",
+    )
+    
+    status = 200 if result["success"] else 400
+    return jsonify({"status": "success" if result["success"] else "error", **result}), status
+
+
+# ------------------------------------------------------------------
+# Registration
+# ------------------------------------------------------------------
+
+def register_tokens(app):
+    """Call in create_app() after register_auth()."""
+    app.register_blueprint(tokens_bp)
+    logger.info(
+        "Token wallet system registered. "
+        "Warn: %d, Block: %d, Default reserve: %d, Max reserve: %d",
+        WARN_THRESHOLD, CRITICAL_THRESHOLD, DEFAULT_RESERVE, MAX_RESERVE
+    )
