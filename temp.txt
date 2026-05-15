@@ -1,127 +1,179 @@
-# ── Token Management Functions ──
-from token_manager import (
-    _get_user_id,           # Helper to get user_id from username
-    estimate_query_tokens,  # For token estimation
-)
-import uuid  # For generating request_id
+  <!-- Token Balance Display -->
+  <div class="token-balance-wrap" id="token-balance-wrap" style="display:none;">
+    <div class="token-pill" id="token-pill">
+      <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+      <span id="token-text">—</span>
+    </div>
+    <div class="token-warning" id="token-warning" style="display:none;">Low quota</div>
+  </div>
 
 
 
------
+--------------------
 
-
-@app.route("/query/stream", methods=["POST", "GET"])
-@login_required    
-def query_stream():
-    """
-    Streaming version of /query using Server-Sent Events.
-    NEW: Integrates token reservation/refund pattern.
-    """
-    from flask import Response, stream_with_context
-    import json
-
-    # ── Extract request params ──
-    if request.method == "GET":
-        question    = (request.args.get("question") or "").strip()
-        max_retries = int(request.args.get("max_retries") or MAX_RETRIES)
-        pinned      = PINNED_TABLES
-    else:
-        body        = request.get_json(silent=True) or {}
-        question    = (body.get("question") or "").strip()
-        max_retries = int(body.get("max_retries") or MAX_RETRIES)
-        pinned      = PINNED_TABLES
-
-    # ── Validate question ──
-    if not question:
-        def _err_gen():
-            yield f"event: pipeline_error\ndata: {json.dumps({'error': 'question is required'})}\n\n"
-            yield "event: done\ndata: {}\n\n"
-        return Response(stream_with_context(_err_gen()),
-                        mimetype="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-    if not pipeline.has_tables():
-        def _err_gen():
-            yield f"event: pipeline_error\ndata: {json.dumps({'error': 'No tables loaded'})}\n\n"
-            yield "event: done\ndata: {}\n\n"
-        return Response(stream_with_context(_err_gen()),
-                        mimetype="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-    # ── Token Management: Get user info ──
-    username = session.get("username")
-    request_id = str(uuid.uuid4())  # Unique ID for this request
-
-    def generate():
-        try:
-            yield ": keep-alive\n\n"   # first byte flushes headers immediately
-            
-            # ── Call pipeline with token tracking ──
-            for chunk in pipeline.stream_query(
-                question=question,
-                pinned_tables=pinned,
-                max_retries=max_retries,
-                username=username,        # ← NEW: for token tracking
-                request_id=request_id,    # ← NEW: for transaction logging
-            ):
-                yield chunk
-                
-        except Exception as exc:
-            import traceback
-            logger.error("stream_query error: %s", traceback.format_exc())
-            yield f"event: pipeline_error\ndata: {json.dumps({'error': str(exc)})}\n\n"
-            yield "event: done\ndata: {}\n\n"
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control":    "no-cache",
-            "X-Accel-Buffering": "no",   # disables nginx buffering
-            "Connection":       "keep-alive",
-        },
-    )
+  /* ── Token Balance UI ── */
+  .token-balance-wrap { display: flex; align-items: center; gap: 8px; }
+  .token-pill {
+    display: flex; align-items: center; gap: 5px;
+    font-size: 11.5px; font-weight: 500; color: var(--text-secondary);
+    background: var(--slate-50); border: 1px solid var(--border);
+    border-radius: 20px; padding: 3px 10px; transition: all 0.2s;
+  }
+  .token-pill.warn  { background: #FFF3E0; border-color: #FFB74D; color: #E65100; }
+  .token-pill.blocked { background: #FFEBEE; border-color: #EF5350; color: #B71C1C; }
+  .token-warning { font-size: 10px; color: var(--teal-600); font-weight: 500; }
+  .token-warning.hidden { display: none; }
 
 
 
+------
 
--------
+let sessions = [];
+let currentSession = null;
+let isLoading = false;
+
+// ── Token State ──
+let tokenState = { available: null, total: null, warn: false, blocked: false };
 
 
-@app.route("/health", methods=["GET"])
-@login_required    
-def health():
-    """Quick liveness check — now includes token balance."""
-    from token_manager import get_wallet, _get_user_id
-    
-    base_response = {
-        "tables_loaded": len(pipeline.loader.table_names()),
-        "table_names":   pipeline.loader.table_names(),
-        "timestamp":     datetime.utcnow().isoformat() + "Z",
+------------
+
+
+
+async function fetchTokenBalance() {
+  try {
+    const r = await fetch(`${API_BASE}/tokens/balance`);
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.status === 'success') {
+      tokenState.available = d.available_tokens;
+      tokenState.total = d.total_allocated;
+      tokenState.warn = d.warn || false;
+      tokenState.blocked = d.blocked || false;
+      updateTokenUI();
     }
-    
-    # Add token balance if user is logged in
-    username = session.get("username")
-    if username:
-        try:
-            user_id = _get_user_id(username)
-            if user_id:
-                wallet = get_wallet(user_id)
-                if wallet:
-                    base_response["token_balance"] = {
-                        "available": wallet["available_tokens"],
-                        "total_allocated": wallet["total_allocated"],
-                        "warn": wallet["warn"],
-                        "blocked": wallet["blocked"],
-                    }
-        except Exception as e:
-            logger.debug("Could not fetch token balance: %s", e)
-    
-    return _ok(base_response)
+  } catch { /* ignore */ }
+}
+
+function updateTokenUI() {
+  const wrap = document.getElementById('token-balance-wrap');
+  const pill = document.getElementById('token-pill');
+  const txt  = document.getElementById('token-text');
+  const warn = document.getElementById('token-warning');
+
+  if (tokenState.available === null) {
+    wrap.style.display = 'none';
+    return;
+  }
+
+  wrap.style.display = 'flex';
+  pill.className = 'token-pill' + (tokenState.warn ? ' warn' : '') + (tokenState.blocked ? ' blocked' : '');
+  
+  if (tokenState.unlimited || tokenState.total === null) {
+    txt.textContent = '∞ tokens';
+    warn.style.display = 'none';
+  } else {
+    txt.textContent = `${tokenState.available.toLocaleString()} / ${tokenState.total.toLocaleString()}`;
+    warn.style.display = tokenState.warn ? 'block' : 'none';
+    warn.textContent = tokenState.warn ? 'Low quota' : (tokenState.blocked ? 'Quota exhausted' : '');
+  }
+}
 
 
 
------------------------------
+----------
+
+// Init
+newChat();
+loadHealth();
+fetchTokenBalance();
+
+
+------
+
+
+          case 'tokens_reserved': {
+            // Update local state temporarily to show reserved amount
+            if (payload.reserved) {
+              const tempBal = Math.max(0, (tokenState.available || 0) - payload.reserved);
+              document.getElementById('token-text').textContent = 
+                `~${tempBal.toLocaleString()} reserved`;
+              document.getElementById('token-pill').classList.add('warn');
+            }
+            break;
+          }
+
+          case 'tokens_adjusted': {
+            // Final balance after query
+            if (payload.balance !== undefined) {
+              tokenState.available = payload.balance;
+              tokenState.warn = payload.balance <= 25000 && payload.balance > 0;
+              tokenState.blocked = payload.balance <= 0;
+              updateTokenUI();
+              
+              // Optional: show brief toast in chat
+              const refundMsg = payload.refunded > 0 ? `Refunded ${payload.refunded.toLocaleString()} unused tokens` : '';
+              if (refundMsg) {
+                const notice = document.createElement('div');
+                notice.className = 'retry-notice';
+                notice.innerHTML = `✓ ${refundMsg}`;
+                bw.appendChild(notice);
+              }
+            }
+            break;
+          }
+
+          case 'tokens_refunded': {
+            // Pipeline failed, full refund
+            if (payload.refunded) {
+              tokenState.available = (tokenState.available || 0) + payload.refunded;
+              updateTokenUI();
+            }
+            break;
+          }
+
+
+-------------
+
+
+
+async function sendQuery() {
+  const input = document.getElementById('query-input');
+  const question = input.value.trim();
+  if (!question || isLoading) return;
+
+  // Block if quota exhausted
+  if (tokenState.blocked) {
+    addStaticMessage({
+      role: 'ai', type: 'error',
+      content: 'Token quota exhausted. Please contact admin to recharge.',
+      ts: nowTs()
+    });
+    return;
+  }
+
+
+
+------------
+
+
+  if (tokenState.blocked) {
+    const area = document.getElementById('chat-area');
+    const err = document.createElement('div');
+    err.className = 'error-bubble';
+    err.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg><span>Token quota exhausted. Please contact admin to recharge.</span>`;
+    area.appendChild(err);
+    scrollToBottom();
+    return;
+  }
+
+
+
+
+-------------
+
+
+
 
 
 
