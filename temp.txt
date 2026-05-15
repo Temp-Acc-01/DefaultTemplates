@@ -1,155 +1,632 @@
-# migration_safe.py
 """
-Safe, Idempotent Migration Script.
-Safe to run multiple times. It checks what exists and skips what's done.
+token_manager.py -- Production-Grade Token Management
+
+Features:
+- Separate wallet table from users
+- Atomic conditional updates (no race conditions)
+- Full transaction ledger for audit
+- Reserve/Refund pattern for streaming queries
+- Token estimation and adjustment
+
+Database Tables:
+- nlq_token_wallets: user balances
+- nlq_token_transactions: audit ledger
 """
+
+import os
+import logging
+import json
+import uuid
+from datetime import datetime
+from typing import Optional, Dict, Any, Tuple
+from contextlib import contextmanager
 
 import pymysql
-import pymysql.cursors  # <-- IMPORTANT FIX
-import os
-from dotenv import load_dotenv
+import pymysql.cursors
+from flask import Blueprint, request, jsonify, session
 
-load_dotenv()
+logger = logging.getLogger(__name__)
 
-MYSQL_HOST = os.environ.get("AUTH_MYSQL_HOST", "localhost")
-MYSQL_PORT = int(os.environ.get("AUTH_MYSQL_PORT", 3306))
-MYSQL_USER = os.environ.get("AUTH_MYSQL_USER", "nabh")
-MYSQL_PASS = os.environ.get("AUTH_MYSQL_PASS", "nabh@2026")
-MYSQL_DB   = os.environ.get("AUTH_MYSQL_DB", "NABH")
+# ─────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────
 
-def column_exists(cursor, table, column):
-    cursor.execute("""
-        SELECT COUNT(*) as cnt FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
-    """, (MYSQL_DB, table, column))
-    return cursor.fetchone()['cnt'] > 0
+MYSQL_HOST  = os.environ.get("AUTH_MYSQL_HOST",  "localhost")
+MYSQL_PORT  = int(os.environ.get("AUTH_MYSQL_PORT", 3306))
+MYSQL_USER  = os.environ.get("AUTH_MYSQL_USER",  "nabh")
+MYSQL_PASS  = os.environ.get("AUTH_MYSQL_PASS",  "nabh@2026")
+MYSQL_DB    = os.environ.get("AUTH_MYSQL_DB",    "NABH")
 
-def table_exists(cursor, table):
-    cursor.execute("""
-        SELECT COUNT(*) as cnt FROM INFORMATION_SCHEMA.TABLES
-        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
-    """, (MYSQL_DB, table))
-    return cursor.fetchone()['cnt'] > 0
+WARN_THRESHOLD     = 25_000   # Show warning when below this
+CRITICAL_THRESHOLD = 0        # Block when at or below this
+DEFAULT_RESERVE    = 25_000   # Default reserve for queries
 
-def migrate():
-    # DictCursor is essential for 'row["id"]' syntax
-    conn = pymysql.connect(
+
+# ─────────────────────────────────────────────────────────────────
+# DB Helpers
+# ─────────────────────────────────────────────────────────────────
+
+def _get_conn():
+    """Get database connection with DictCursor."""
+    return pymysql.connect(
         host=MYSQL_HOST,
         port=MYSQL_PORT,
         user=MYSQL_USER,
         password=MYSQL_PASS,
         database=MYSQL_DB,
-        cursorclass=pymysql.cursors.DictCursor,  # <-- FIXES YOUR ERROR
-        autocommit=False
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,  # Manual transaction control
+        connect_timeout=10,
     )
-    
+
+
+@contextmanager
+def _transaction():
+    """Context manager for database transactions."""
+    conn = _get_conn()
     try:
-        with conn.cursor() as cur:
-            
-            # 1. Check/Add ID Column
-            if column_exists(cur, 'nlq_user_details', 'id'):
-                print("✅ Column 'id' already exists.")
-            else:
-                print("➕ Adding 'id' column...")
-                cur.execute("ALTER TABLE nlq_user_details ADD COLUMN id BIGINT AUTO_INCREMENT PRIMARY KEY FIRST")
-                conn.commit()
-                print("✅ Column 'id' added.")
-
-            # 2. Check/Create Wallets Table
-            if table_exists(cur, 'nlq_token_wallets'):
-                print("✅ Table 'nlq_token_wallets' already exists.")
-            else:
-                print("➕ Creating 'nlq_token_wallets' table...")
-                cur.execute("""
-                    CREATE TABLE nlq_token_wallets (
-                        user_id BIGINT PRIMARY KEY,
-                        total_allocated BIGINT NOT NULL DEFAULT 0,
-                        total_used BIGINT NOT NULL DEFAULT 0,
-                        available_tokens BIGINT NOT NULL DEFAULT 0,
-                        updated_at TIMESTAMP DEFAULT NOW(),
-                        FOREIGN KEY (user_id) REFERENCES nlq_user_details(id) ON DELETE CASCADE
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """)
-                conn.commit()
-                print("✅ Table 'nlq_token_wallets' created.")
-
-            # 3. Check/Create Transactions Table
-            if table_exists(cur, 'nlq_token_transactions'):
-                print("✅ Table 'nlq_token_transactions' already exists.")
-            else:
-                print("➕ Creating 'nlq_token_transactions' table...")
-                cur.execute("""
-                    CREATE TABLE nlq_token_transactions (
-                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                        user_id BIGINT NOT NULL,
-                        type VARCHAR(20) NOT NULL,
-                        tokens BIGINT NOT NULL,
-                        request_id VARCHAR(100),
-                        model_name VARCHAR(100),
-                        balance_before BIGINT,
-                        balance_after BIGINT,
-                        metadata JSON,
-                        created_at TIMESTAMP DEFAULT NOW(),
-                        FOREIGN KEY (user_id) REFERENCES nlq_user_details(id) ON DELETE CASCADE,
-                        INDEX idx_user_id (user_id),
-                        INDEX idx_created_at (created_at)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """)
-                conn.commit()
-                print("✅ Table 'nlq_token_transactions' created.")
-
-            # 4. Migrate Data (Only if not already done)
-            print(" Checking for data to migrate...")
-            
-            # Check if api_tokens column exists (it might have been dropped already)
-            if not column_exists(cur, 'nlq_user_details', 'api_tokens'):
-                print("ℹ️  'api_tokens' column not found (or already dropped). Skipping migration.")
-            else:
-                # Check if wallets already have data
-                cur.execute("SELECT COUNT(*) as cnt FROM nlq_token_wallets")
-                wallet_count = cur.fetchone()['cnt']
-                
-                if wallet_count > 0:
-                    print(f"ℹ️  {wallet_count} wallets already exist. Skipping migration to prevent duplicates.")
-                else:
-                    print("➕ Migrating data from 'api_tokens'...")
-                    cur.execute("SELECT id, api_tokens FROM nlq_user_details WHERE api_tokens IS NOT NULL")
-                    users = cur.fetchall()
-                    
-                    migrated = 0
-                    for user in users:
-                        api_tokens = user['api_tokens']
-                        if api_tokens:
-                            if '/' in str(api_tokens):
-                                parts = str(api_tokens).split('/')
-                                total, available = int(parts[1]), int(parts[0])
-                            else:
-                                total, available = int(api_tokens), int(api_tokens)
-                            
-                            cur.execute("""
-                                INSERT INTO nlq_token_wallets 
-                                (user_id, total_allocated, available_tokens)
-                                VALUES (%s, %s, %s)
-                            """, (user['id'], total, available))
-                            
-                            cur.execute("""
-                                INSERT INTO nlq_token_transactions
-                                (user_id, type, tokens, balance_before, balance_after, metadata)
-                                VALUES (%s, 'MIGRATE', %s, 0, %s, 'initial_migration')
-                            """, (user['id'], total, available))
-                            migrated += 1
-                    
-                    conn.commit()
-                    print(f"✅ Migrated {migrated} users.")
-
-        print("\n🎉 Migration finished successfully!")
-        
-    except Exception as e:
+        yield conn
+        conn.commit()
+    except Exception:
         conn.rollback()
-        print(f"\n❌ Failed: {e}")
         raise
     finally:
         conn.close()
 
-if __name__ == "__main__":
-    migrate()
+
+def _get_user_id(username: str) -> Optional[int]:
+    """Get user ID from username."""
+    with _transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM nlq_user_details WHERE username = %s LIMIT 1",
+                (username,)
+            )
+            row = cur.fetchone()
+            return row['id'] if row else None
+
+
+# ─────────────────────────────────────────────────────────────────
+# Wallet Operations (Atomic & Safe)
+# ─────────────────────────────────────────────────────────────────
+
+def get_wallet(user_id: int) -> Dict[str, Any]:
+    """
+    Get wallet balance for user.
+    Returns wallet data or None if user has no wallet.
+    """
+    with _transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT user_id, total_allocated, total_used, 
+                       available_tokens, updated_at
+                FROM nlq_token_wallets
+                WHERE user_id = %s
+            """, (user_id,))
+            row = cur.fetchone()
+            
+            if not row:
+                return None
+            
+            available = row['available_tokens']
+            return {
+                'user_id': row['user_id'],
+                'total_allocated': row['total_allocated'],
+                'total_used': row['total_used'],
+                'available_tokens': available,
+                'updated_at': row['updated_at'],
+                'unlimited': False,
+                'warn': 0 < available <= WARN_THRESHOLD,
+                'blocked': available <= CRITICAL_THRESHOLD,
+            }
+
+
+def ensure_wallet(user_id: int, initial_tokens: int = 0) -> Dict[str, Any]:
+    """
+    Ensure user has a wallet. Create if doesn't exist.
+    """
+    with _transaction() as conn:
+        with conn.cursor() as cur:
+            # Try to insert, ignore if exists
+            cur.execute("""
+                INSERT IGNORE INTO nlq_token_wallets
+                (user_id, total_allocated, total_used, available_tokens, updated_at)
+                VALUES (%s, %s, 0, %s, NOW())
+            """, (user_id, initial_tokens, initial_tokens))
+            
+            # If inserted, log the allocation
+            if cur.rowcount > 0:
+                cur.execute("""
+                    INSERT INTO nlq_token_transactions
+                    (user_id, type, tokens, balance_before, balance_after, metadata)
+                    VALUES (%s, 'ALLOCATE', %s, 0, %s, 
+                            JSON_OBJECT('note', 'Initial wallet creation'))
+                """, (user_id, initial_tokens, initial_tokens))
+            
+            conn.commit()
+    
+    return get_wallet(user_id)
+
+
+def allocate_tokens(user_id: int, amount: int, request_id: str = None) -> Dict[str, Any]:
+    """
+    Allocate tokens to user (admin operation).
+    Uses atomic update with transaction logging.
+    """
+    if amount <= 0:
+        raise ValueError("Allocation amount must be positive")
+    
+    with _transaction() as conn:
+        with conn.cursor() as cur:
+            # Get current balance
+            cur.execute("""
+                SELECT available_tokens, total_allocated
+                FROM nlq_token_wallets
+                WHERE user_id = %s FOR UPDATE
+            """, (user_id,))
+            row = cur.fetchone()
+            
+            if not row:
+                # Create wallet if doesn't exist
+                cur.execute("""
+                    INSERT INTO nlq_token_wallets
+                    (user_id, total_allocated, available_tokens, updated_at)
+                    VALUES (%s, %s, %s, NOW())
+                """, (user_id, amount, amount))
+                balance_before = 0
+                balance_after = amount
+            else:
+                balance_before = row['available_tokens']
+                new_allocated = row['total_allocated'] + amount
+                new_available = row['available_tokens'] + amount
+                
+                # Atomic update
+                cur.execute("""
+                    UPDATE nlq_token_wallets
+                    SET total_allocated = %s,
+                        available_tokens = %s,
+                        updated_at = NOW()
+                    WHERE user_id = %s
+                """, (new_allocated, new_available, user_id))
+                
+                balance_after = new_available
+            
+            # Log transaction
+            cur.execute("""
+                INSERT INTO nlq_token_transactions
+                (user_id, type, tokens, request_id, balance_before, balance_after, metadata)
+                VALUES (%s, 'ALLOCATE', %s, %s, %s, %s, 
+                        JSON_OBJECT('admin_operation', true))
+            """, (user_id, amount, request_id, balance_before, balance_after))
+            
+            conn.commit()
+    
+    logger.info("Allocated %d tokens to user %d: %d → %d", 
+                amount, user_id, balance_before, balance_after)
+    
+    return get_wallet(user_id)
+
+
+def deduct_tokens(user_id: int, amount: int, request_id: str = None,
+                  model_name: str = None, metadata: Dict = None) -> Dict[str, Any]:
+    """
+    Deduct tokens atomically.
+    
+    CRITICAL: Uses conditional UPDATE to prevent race conditions.
+    Only succeeds if user has sufficient balance.
+    
+    Returns:
+        {success: bool, wallet: dict, message: str}
+    """
+    if amount <= 0:
+        wallet = get_wallet(user_id)
+        return {'success': True, 'wallet': wallet, 'message': 'No deduction needed'}
+    
+    with _transaction() as conn:
+        with conn.cursor() as cur:
+            # Get current balance
+            cur.execute("""
+                SELECT available_tokens, total_allocated, total_used
+                FROM nlq_token_wallets
+                WHERE user_id = %s FOR UPDATE
+            """, (user_id,))
+            row = cur.fetchone()
+            
+            if not row:
+                return {
+                    'success': False,
+                    'wallet': None,
+                    'message': 'User has no wallet'
+                }
+            
+            balance_before = row['available_tokens']
+            
+            if balance_before < amount:
+                return {
+                    'success': False,
+                    'wallet': get_wallet(user_id),
+                    'message': f'Insufficient balance: {balance_before} < {amount}'
+                }
+            
+            # Atomic deduction
+            new_available = balance_before - amount
+            new_used = row['total_used'] + amount
+            
+            cur.execute("""
+                UPDATE nlq_token_wallets
+                SET available_tokens = %s,
+                    total_used = %s,
+                    updated_at = NOW()
+                WHERE user_id = %s AND available_tokens >= %s
+            """, (new_available, new_used, user_id, amount))
+            
+            if cur.rowcount == 0:
+                # Race condition: another request deducted first
+                conn.rollback()
+                logger.warning("Concurrent deduction detected for user %d", user_id)
+                return {
+                    'success': False,
+                    'wallet': get_wallet(user_id),
+                    'message': 'Concurrent update -- please retry'
+                }
+            
+            # Log transaction
+            meta_json = json.dumps(metadata) if metadata else '{}'
+            cur.execute("""
+                INSERT INTO nlq_token_transactions
+                (user_id, type, tokens, request_id, model_name, 
+                 balance_before, balance_after, metadata)
+                VALUES (%s, 'DEDUCT', %s, %s, %s, %s, %s, %s)
+            """, (user_id, amount, request_id, model_name, 
+                  balance_before, new_available, meta_json))
+            
+            conn.commit()
+    
+    logger.info("Deducted %d tokens from user %d: %d → %d",
+                amount, user_id, balance_before, new_available)
+    
+    return {
+        'success': True,
+        'wallet': get_wallet(user_id),
+        'message': 'OK'
+    }
+
+
+def reserve_tokens(user_id: int, amount: int, request_id: str,
+                   model_name: str = None) -> Dict[str, Any]:
+    """
+    Reserve tokens for an operation (like streaming query).
+    Tokens are deducted upfront and can be refunded later.
+    
+    This prevents abuse and ensures user has sufficient balance
+    before starting expensive operations.
+    """
+    result = deduct_tokens(
+        user_id=user_id,
+        amount=amount,
+        request_id=request_id,
+        model_name=model_name,
+        metadata={'operation': 'reserve'}
+    )
+    
+    if result['success']:
+        logger.info("Reserved %d tokens for request %s", amount, request_id)
+    
+    return result
+
+
+def refund_tokens(user_id: int, amount: int, request_id: str,
+                  reason: str = 'unused') -> Dict[str, Any]:
+    """
+    Refund reserved tokens (partial or full).
+    Used when actual usage is less than reserved amount.
+    """
+    if amount <= 0:
+        return {'success': True, 'wallet': get_wallet(user_id), 'message': 'Nothing to refund'}
+    
+    with _transaction() as conn:
+        with conn.cursor() as cur:
+            # Get current balance
+            cur.execute("""
+                SELECT available_tokens
+                FROM nlq_token_wallets
+                WHERE user_id = %s FOR UPDATE
+            """, (user_id,))
+            row = cur.fetchone()
+            
+            if not row:
+                return {'success': False, 'wallet': None, 'message': 'User has no wallet'}
+            
+            balance_before = row['available_tokens']
+            new_available = balance_before + amount
+            
+            cur.execute("""
+                UPDATE nlq_token_wallets
+                SET available_tokens = %s,
+                    updated_at = NOW()
+                WHERE user_id = %s
+            """, (new_available, user_id))
+            
+            # Log refund transaction
+            cur.execute("""
+                INSERT INTO nlq_token_transactions
+                (user_id, type, tokens, request_id, balance_before, balance_after, metadata)
+                VALUES (%s, 'REFUND', %s, %s, %s, %s, JSON_OBJECT('reason', %s))
+            """, (user_id, amount, request_id, balance_before, new_available, reason))
+            
+            conn.commit()
+    
+    logger.info("Refunded %d tokens to user %d (request %s): %d → %d",
+                amount, user_id, request_id, balance_before, new_available)
+    
+    return {
+        'success': True,
+        'wallet': get_wallet(user_id),
+        'message': f'Refunded {amount} tokens'
+    }
+
+
+def adjust_tokens(user_id: int, reserved: int, actual: int, 
+                  request_id: str, model_name: str = None) -> Dict[str, Any]:
+    """
+    Adjust tokens after operation completes.
+    If actual < reserved: refund the difference
+    If actual > reserved: deduct the difference
+    
+    This is the final step in the reserve/refund pattern.
+    """
+    if actual == reserved:
+        # Perfect match - just update the transaction log
+        return {
+            'success': True,
+            'wallet': get_wallet(user_id),
+            'message': 'No adjustment needed',
+            'adjusted': 0
+        }
+    
+    difference = reserved - actual
+    
+    if difference > 0:
+        # Refund unused tokens
+        result = refund_tokens(
+            user_id=user_id,
+            amount=difference,
+            request_id=request_id,
+            reason='unused_tokens'
+        )
+        result['adjusted'] = difference
+        result['message'] = f'Refunded {difference} unused tokens'
+    else:
+        # Deduct additional tokens (shouldn't happen often with good estimation)
+        result = deduct_tokens(
+            user_id=user_id,
+            amount=abs(difference),
+            request_id=request_id,
+            model_name=model_name,
+            metadata={'operation': 'adjustment', 'reason': 'underestimated'}
+        )
+        result['adjusted'] = difference
+        result['message'] = f'Deducted {abs(difference)} additional tokens'
+    
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# Token Estimation (for Reserve Pattern)
+# ─────────────────────────────────────────────────────────────────
+
+def estimate_query_tokens(question: str) -> int:
+    """
+    Estimate tokens needed for a query.
+    Simple heuristic: ~4 chars per token + overhead.
+    
+    For production, you might want to:
+    - Use tiktoken library for accurate estimation
+    - Track historical usage per user/query type
+    - Adjust based on complexity
+    """
+    # Rough estimate: question length + SQL generation overhead
+    base_estimate = len(question) // 3  # ~3 chars per token average
+    
+    # Add overhead for SQL generation, validation, visualization
+    overhead = 5000  # Base overhead
+    
+    # Add buffer (50% extra)
+    estimate = int((base_estimate + overhead) * 1.5)
+    
+    # Cap between min and max
+    min_tokens = 10000
+    max_tokens = 100000
+    
+    return max(min_tokens, min(estimate, max_tokens))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Flask Blueprint & Routes
+# ─────────────────────────────────────────────────────────────────
+
+tokens_bp = Blueprint("tokens", __name__)
+
+
+def _session_username() -> Optional[str]:
+    """Get username from Flask session."""
+    return session.get("username")
+
+
+def _session_user_id() -> Optional[int]:
+    """Get user ID from username in session."""
+    username = _session_username()
+    if not username:
+        return None
+    return _get_user_id(username)
+
+
+def token_login_required(f):
+    """Decorator to require authentication."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not _session_username():
+            return jsonify({
+                "status": "error",
+                "message": "Not authenticated"
+            }), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+@tokens_bp.route("/tokens/balance", methods=["GET"])
+@token_login_required
+def balance_route():
+    """
+    GET /tokens/balance
+    Returns current token balance for logged-in user.
+    """
+    user_id = _session_user_id()
+    if not user_id:
+        return jsonify({
+            "status": "error",
+            "message": "User not found"
+        }), 404
+    
+    wallet = get_wallet(user_id)
+    if not wallet:
+        wallet = ensure_wallet(user_id, initial_tokens=0)
+    
+    return jsonify({
+        "status": "success",
+        **wallet
+    })
+
+
+@tokens_bp.route("/tokens/deduct", methods=["POST"])
+@token_login_required
+def deduct_route():
+    """
+    POST /tokens/deduct
+    Body: { "amount": 12345, "request_id": "optional" }
+    
+    Direct deduction (not reserve pattern).
+    """
+    user_id = _session_user_id()
+    body = request.get_json(silent=True) or {}
+    amount = int(body.get("amount") or 0)
+    request_id = body.get("request_id") or str(uuid.uuid4())
+    
+    result = deduct_tokens(
+        user_id=user_id,
+        amount=amount,
+        request_id=request_id
+    )
+    
+    status_code = 200 if result['success'] else 402
+    return jsonify({
+        "status": "success" if result['success'] else "error",
+        **result
+    }), status_code
+
+
+@tokens_bp.route("/tokens/allocate", methods=["POST"])
+@token_login_required
+def allocate_route():
+    """
+    POST /tokens/allocate
+    Body: { "username": "user123", "amount": 100000 }
+    
+    Admin-only endpoint to allocate tokens to a user.
+    In production, add admin role check here.
+    """
+    body = request.get_json(silent=True) or {}
+    username = body.get("username")
+    amount = int(body.get("amount") or 0)
+    request_id = body.get("request_id") or str(uuid.uuid4())
+    
+    if not username:
+        return jsonify({
+            "status": "error",
+            "message": "username required"
+        }), 400
+    
+    user_id = _get_user_id(username)
+    if not user_id:
+        return jsonify({
+            "status": "error",
+            "message": f"User '{username}' not found"
+        }), 404
+    
+    try:
+        result = allocate_tokens(
+            user_id=user_id,
+            amount=amount,
+            request_id=request_id
+        )
+        return jsonify({
+            "status": "success",
+            **result
+        })
+    except Exception as e:
+        logger.error("Allocation failed: %s", e)
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+
+@tokens_bp.route("/tokens/transactions", methods=["GET"])
+@token_login_required
+def transactions_route():
+    """
+    GET /tokens/transactions?limit=50&offset=0
+    Returns transaction history for current user.
+    """
+    user_id = _session_user_id()
+    limit = min(int(request.args.get("limit") or 50), 100)
+    offset = int(request.args.get("offset") or 0)
+    
+    with _transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, type, tokens, request_id, model_name,
+                       balance_before, balance_after, metadata, created_at
+                FROM nlq_token_transactions
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+            """, (user_id, limit, offset))
+            
+            transactions = cur.fetchall()
+            
+            # Get total count
+            cur.execute("""
+                SELECT COUNT(*) as total
+                FROM nlq_token_transactions
+                WHERE user_id = %s
+            """, (user_id,))
+            total = cur.fetchone()['total']
+    
+    # Convert datetime to ISO format
+    for tx in transactions:
+        if tx['created_at']:
+            tx['created_at'] = tx['created_at'].isoformat()
+    
+    return jsonify({
+        "status": "success",
+        "transactions": transactions,
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    })
+
+
+# ─────────────────────────────────────────────────────────────────
+# Registration
+# ─────────────────────────────────────────────────────────────────
+
+def register_tokens(app):
+    """
+    Register token manager blueprint.
+    Call in create_app() after register_auth(app).
+    """
+    app.register_blueprint(tokens_bp)
+    logger.info("Token manager registered (wallet + transaction ledger)")
+    logger.info("Thresholds: warn=%d, critical=%d, default_reserve=%d",
+                WARN_THRESHOLD, CRITICAL_THRESHOLD, DEFAULT_RESERVE)
