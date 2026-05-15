@@ -1,44 +1,72 @@
-# manage_user_tokens.py
+# create_user.py - DEBUG VERSION
 import pymysql
 import os
 from dotenv import load_dotenv
-from token_manager import allocate_tokens, _get_conn
+from token_manager import allocate_tokens, _get_conn, get_wallet, ensure_wallet
 
 load_dotenv()
 
-# ── CONFIG ──
-USERNAME = "existing_user"      # Change to target user
-PASSWORD = "SecurePass123!"     # Only used if creating a NEW user
-TOKENS_TO_ADD = 500_000         # Tokens to ADD (top-up amount)
+USERNAME = "user"
+PASSWORD = "user123"
+TOKENS   = 1_000_000
+
+print(f"🔍 Starting user creation for '{USERNAME}'...")
 
 conn = _get_conn()
 try:
     with conn.cursor() as cur:
-        # 1. Check if user already exists
+        # 1. Check if user exists
         cur.execute("SELECT id FROM nlq_user_details WHERE username = %s", (USERNAME,))
         user_row = cur.fetchone()
-
+        
         if user_row:
             user_id = user_row['id']
-            print(f"✅ User '{USERNAME}' found (ID: {user_id})")
+            print(f"⚠️  User '{USERNAME}' already exists (ID: {user_id})")
         else:
-            # Create new user
+            # Create user
+            print(f"➕ Creating user '{USERNAME}'...")
             cur.execute(
                 "INSERT INTO nlq_user_details (username, password) VALUES (%s, %s)",
                 (USERNAME, PASSWORD)
             )
             user_id = cur.lastrowid
             conn.commit()
-            print(f"✅ User '{USERNAME}' created (ID: {user_id})")
+            print(f"✅ User created with ID: {user_id}")
 
-        # 2. Allocate tokens (works for both new & existing users)
-        result = allocate_tokens(user_id, TOKENS_TO_ADD, request_id="manual_topup")
-        print(f"✅ Added {TOKENS_TO_ADD:,} tokens to '{USERNAME}'")
-        print(f"   New balance: {result['wallet']['available_tokens']:,}")
-        print(f"   Total allocated: {result['wallet']['total_allocated']:,}")
+    # 2. Check if wallet exists
+    print(f"🔍 Checking wallet for user_id={user_id}...")
+    wallet = get_wallet(user_id)
+    
+    if wallet:
+        print(f"✅ Wallet found: {wallet}")
+    else:
+        print(f"⚠️  No wallet found - creating one...")
+        wallet = ensure_wallet(user_id, initial_tokens=0)
+        print(f"✅ Wallet created: {wallet}")
+
+    # 3. Allocate tokens
+    print(f"💰 Allocating {TOKENS:,} tokens...")
+    result = allocate_tokens(user_id, TOKENS, request_id="manual_setup")
+    
+    print(f"📦 Allocate result keys: {result.keys()}")
+    print(f"📦 Result: {result}")
+    
+    if result.get('success'):
+        if result.get('wallet'):
+            print(f"✅ Tokens allocated successfully!")
+            print(f"   Balance: {result['wallet']['available_tokens']:,}")
+        else:
+            print(f"⚠️  Allocation succeeded but wallet is None - fetching...")
+            wallet = get_wallet(user_id)
+            print(f"   Current balance: {wallet['available_tokens']:,}")
+    else:
+        print(f"❌ Allocation failed: {result.get('message')}")
 
 except Exception as e:
-    print(f"❌ Failed: {e}")
+    import traceback
+    print(f"❌ Failed with exception: {e}")
+    print(f"📋 Traceback:")
+    traceback.print_exc()
     conn.rollback()
 finally:
     conn.close()
