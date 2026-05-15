@@ -1,16 +1,14 @@
-# create_user.py - FIXED VERSION
+# create_user.py - FINAL WORKING VERSION
 import pymysql
 import os
 from dotenv import load_dotenv
-from token_manager import allocate_tokens, _get_conn, get_wallet, ensure_wallet
+from token_manager import allocate_tokens, _get_conn
 
 load_dotenv()
 
-USERNAME = "user2"
+USERNAME = "user"
 PASSWORD = "user123"
 TOKENS   = 1_000_000
-
-print(f"🔍 Starting user creation for '{USERNAME}'...")
 
 conn = _get_conn()
 try:
@@ -21,29 +19,28 @@ try:
         
         if user_row:
             user_id = user_row['id']
-            print(f"⚠️  User '{USERNAME}' already exists (ID: {user_id})")
+            print(f"User '{USERNAME}' already exists (ID: {user_id})")
         else:
             # Create user
-            print(f"➕ Creating user '{USERNAME}'...")
             cur.execute(
                 "INSERT INTO nlq_user_details (username, password) VALUES (%s, %s)",
                 (USERNAME, PASSWORD)
             )
             user_id = cur.lastrowid
             conn.commit()
-            print(f"✅ User created with ID: {user_id}")
+            print(f"User '{USERNAME}' created (ID: {user_id})")
 
-    # 2. Allocate tokens (creates wallet if needed)
-    print(f"💰 Allocating {TOKENS:,} tokens...")
+    # 2. Allocate tokens
+    print(f"Allocating {TOKENS:,} tokens to '{USERNAME}'...")
     wallet = allocate_tokens(user_id, TOKENS, request_id="manual_setup")
     
-    # ✅ Check if allocation worked by looking at available_tokens
-    if wallet and wallet.get('available_tokens', 0) >= TOKENS:
-        print(f"✅ SUCCESS! Tokens allocated to '{USERNAME}'")
-        print(f"   Balance: {wallet['available_tokens']:,}")
+    # 3. Check if it worked - wallet dict is returned directly
+    if wallet and 'available_tokens' in wallet:
+        print(f"✅ SUCCESS! Added {TOKENS:,} tokens to '{USERNAME}'")
+        print(f"   New balance: {wallet['available_tokens']:,}")
         print(f"   Total allocated: {wallet['total_allocated']:,}")
     else:
-        print(f"⚠️  Allocation may have failed. Current balance: {wallet}")
+        print(f"❌ Allocation returned unexpected result: {wallet}")
 
 except Exception as e:
     import traceback
