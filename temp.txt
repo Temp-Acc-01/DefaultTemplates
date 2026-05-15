@@ -1,104 +1,227 @@
-tooltip: {
-                enabled: true,
-                position: 'nearest',
-                callbacks: {
-                  title: (items) => {
-                    const idx = items[0].dataIndex;
-                    const lo  = hist.labels[idx];
-                    const hi  = +(lo + (hist.step || 0)).toFixed(2);
-                    return `${fmt(lo)} – ${fmt(hi)}`;
-                  },
-                  label: (item) => `Count: ${item.raw}`,
-                },
-                backgroundColor: 'rgba(255,255,255,0.97)',
-                titleColor:      '#1A2535',
-                bodyColor:       '#4A5E7A',
-                borderColor:     'rgba(100,130,180,0.2)',
-                borderWidth:     1,
-                padding:         6,
-                cornerRadius:    6,
-                displayColors:   false,
-                boxShadow:       '0 2px 8px rgba(0,0,0,0.08)',
-              }
+<div class="topbar">
+    <span class="topbar-title" id="session-title">New conversation</span>
+    <span class="topbar-badge" id="tables-badge">Loading…</span>
+    <div class="back-btn-wrap" title="Back to dashboard">
+      <button class="back-btn" onclick="confirmBackToDashboard()">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 12H5M12 5l-7 7 7 7"/>
+        </svg>
+        Back
+      </button>
+      <div class="back-btn-tooltip">Back to dashboard</div>
+    </div>
+  </div>
 
 
 
-------
+------------
 
-<!-- mean marker — solid red line -->
-          <div class="sdt-marker" id="sdt-mean-${ci}" style="
-            position:absolute; top:0; bottom:0; width:0;
-            border-left:2px solid rgba(220,50,50,0.75); cursor:default;
-          ">
-            <div class="sdt-marker-tip">Mean: ${fmt(s.mean)}</div>
-          </div>
-          <!-- median marker — dashed purple -->
-          <div class="sdt-marker" id="sdt-med-${ci}" style="
-            position:absolute; top:0; bottom:0; width:0;
-            border-left:1.5px dashed #7066D4; cursor:default;
-          ">
-            <div class="sdt-marker-tip">Median: ${fmt(s.median)}</div>
-          </div>
+/* ── Back to dashboard button ── */
+  .back-btn-wrap {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .back-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 11px;
+    font-size: 11.5px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    color: #9B4040;
+    background: #FDF1F1;
+    border: 1px solid #F2CACA;
+    border-radius: 20px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+    letter-spacing: 0.1px;
+  }
+
+  .back-btn:hover {
+    background: #F9E3E3;
+    border-color: #E8AFAF;
+    color: #7A2E2E;
+  }
+
+  .back-btn-tooltip {
+    position: absolute;
+    top: calc(100% + 7px);
+    right: 0;
+    background: rgba(26, 37, 53, 0.88);
+    color: #fff;
+    font-size: 10.5px;
+    font-family: 'DM Sans', sans-serif;
+    padding: 4px 9px;
+    border-radius: 6px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(-3px);
+    transition: opacity 0.15s, transform 0.15s;
+    z-index: 100;
+  }
+
+  .back-btn-wrap:hover .back-btn-tooltip {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  /* ── Back confirmation modal ── */
+  .back-confirm-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 4000;
+    align-items: center;
+    justify-content: center;
+    background: rgba(15, 25, 50, 0.3);
+    backdrop-filter: blur(2px);
+    animation: fadeUp 0.15s ease;
+  }
+
+  .back-confirm-overlay.open {
+    display: flex;
+  }
+
+  .back-confirm-card {
+    background: var(--surface);
+    border: 1px solid var(--border-md);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 8px 32px rgba(15, 25, 50, 0.12);
+    padding: 22px 24px 18px;
+    width: 320px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    animation: fadeUp 0.18s ease;
+  }
+
+  .back-confirm-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: #FDF1F1;
+    border: 1px solid #F2CACA;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .back-confirm-title {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: -0.1px;
+  }
+
+  .back-confirm-body {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    line-height: 1.55;
+    margin-top: -6px;
+  }
+
+  .back-confirm-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 2px;
+  }
+
+  .back-confirm-cancel {
+    padding: 5px 14px;
+    font-size: 12px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: transparent;
+    border: 1px solid var(--border-md);
+    border-radius: 20px;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .back-confirm-cancel:hover {
+    background: var(--slate-100);
+    color: var(--text-primary);
+  }
+
+  .back-confirm-go {
+    padding: 5px 14px;
+    font-size: 12px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    color: #9B4040;
+    background: #FDF1F1;
+    border: 1px solid #F2CACA;
+    border-radius: 20px;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+
+  .back-confirm-go:hover {
+    background: #F9E3E3;
+    border-color: #E8AFAF;
+    color: #7A2E2E;
+  }
+
+
+--------
+
+
+<!-- Back to dashboard confirmation -->
+<div class="back-confirm-overlay" id="back-confirm-overlay">
+  <div class="back-confirm-card">
+    <div style="display:flex; align-items:center; gap:10px;">
+      <div class="back-confirm-icon">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#C05050" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 12H5M12 5l-7 7 7 7"/>
+        </svg>
+      </div>
+      <span class="back-confirm-title">Leave this session?</span>
+    </div>
+    <p class="back-confirm-body">Your current analysis and conversation will not be saved when you go back.</p>
+    <div class="back-confirm-actions">
+      <button class="back-confirm-cancel" onclick="closeBackConfirm()">Stay here</button>
+      <button class="back-confirm-go" onclick="goToDashboard()">Go back</button>
+    </div>
+  </div>
+</div>
+
+
+--------------
 
 
 
-----
-.sdt-marker-tip {
-  position:absolute;
-  bottom:calc(100% + 5px);
-  left:50%;
-  transform:translateX(-50%);
-  background:rgba(255,255,255,0.97);
-  color:#1A2535;
-  font-size:9px;
-  font-weight:500;
-  padding:3px 8px;
-  border-radius:5px;
-  border:1px solid rgba(100,130,180,0.2);
-  box-shadow:0 2px 8px rgba(0,0,0,0.09);
-  white-space:nowrap;
-  pointer-events:none;
-  opacity:0;
-  transition:opacity 0.15s;
-  z-index:100;
+// ─── Back to dashboard ───────────────────────────────────────────
+const DASHBOARD_URL = 'http://YOUR_IP:YOUR_PORT';  // ← replace with your dashboard route
+
+function confirmBackToDashboard() {
+  document.getElementById('back-confirm-overlay').classList.add('open');
+  document.body.style.overflow = 'hidden';
 }
-.sdt-marker:hover .sdt-marker-tip { opacity:1; }
 
-----
-
-
-
-.dt-spark-wrap {
-  position:relative; width:100%; height:36px; margin-bottom:2px;
-  overflow:visible;
+function closeBackConfirm() {
+  document.getElementById('back-confirm-overlay').classList.remove('open');
+  document.body.style.overflow = '';
 }
 
-
-
------------
-
-
-
-.dt-stat-card {
-  padding:6px 10px 5px;
-  border-right:1px solid rgba(100,130,180,0.09);
-  box-sizing:border-box;
-  overflow:visible;
-  position:relative;
-  z-index:1;
+function goToDashboard() {
+  closeBackConfirm();
+  window.location.href = DASHBOARD_URL;
 }
 
+// Close on overlay backdrop click
+document.getElementById('back-confirm-overlay')?.addEventListener('click', function(e) {
+  if (e.target === this) closeBackConfirm();
+});
 
 
------------
 
-
-.dt-stats-row td {
-  padding:0; background:#fff;
-  border-bottom:1px solid rgba(100,130,180,0.13);
-  vertical-align:top;
-  overflow:visible;
-}
+--------
 
 
 
