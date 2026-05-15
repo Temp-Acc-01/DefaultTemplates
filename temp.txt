@@ -1,14 +1,15 @@
 /**
- * datatable_module.js  —  Sarthi Rich Datatable  v2
+ * datatable_module.js  —  Sarthi Rich Datatable  (enhanced)
  *
- * Fixes in v2:
- *  1. Reduced top padding / compact stats strip
- *  2. Stats cards width-aligned to column headers (shared scroll)
- *  3. Filter icon → 3-line slider icon (interpretable)
- *  4. Histogram: min/max labels at bottom corners, dotted mean(blue) +
- *     median(purple) vertical lines with hover tooltip
- *  5. Sort icon: 3-state always-visible (neutral ↕ faded | asc ↑ blue | desc ↓ blue)
- *     cycling: none → asc → desc → none
+ * Changes from v1:
+ *  1. Stats strip cards align width to column headers (shared colWidths array)
+ *  2. Reduced topbar + strip padding — minimal gap
+ *  3. Filter icon replaced with slider/equalizer icon (matching UI style)
+ *  4. Sort icons: unsorted ↕ / asc ↑ / desc ↓ — visible always on header
+ *  5. Histograms: min label bottom-left, max label bottom-right,
+ *     dotted vertical lines for mean (blue) and median (purple) with hover tooltip
+ *  6. Stats strip cards update live when filters change
+ *  7. Interactive histograms — clicking a bar sets a range filter on that column
  *
  * Usage:
  *   SarthiDatatable.open(csvUrl, title)
@@ -18,663 +19,1105 @@
 (function (global) {
   'use strict';
 
+  /* ═══════════════════════════════════════════════════════════════════
+     CONSTANTS
+  ═══════════════════════════════════════════════════════════════════ */
   const VIRTUAL_ROW_H  = 34;
-  const VIRTUAL_BUFFER = 40;
-  const COL_MIN_W      = 140;
+  const VIRTUAL_BUFFER = 30;
   const CHARTJS_CDN    = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js';
+  const COL_MIN_W      = 140;   // minimum column width px
+  const COL_PAD        = 28;    // horizontal padding inside cell
 
-  /* ── STATE ── */
-  let _st = {
-    rawData: [], columns: [], filteredData: [], filters: {},
-    sortCol: null, sortDir: 'none',
-    csvUrl: null, title: '',
-    sparkCharts: {}, panelOpen: null, globalSearch: '', colWidths: [],
+  const PASTEL = [
+    'rgba(91,163,245,0.55)',
+    'rgba(43,191,165,0.55)',
+    'rgba(112,102,212,0.55)',
+    'rgba(242,196,206,0.85)',
+    'rgba(250,217,161,0.85)',
+    'rgba(168,216,185,0.85)',
+  ];
+
+  /* ═══════════════════════════════════════════════════════════════════
+     STATE
+  ═══════════════════════════════════════════════════════════════════ */
+  let _state = {
+    rawData:       [],
+    columns:       [],
+    filteredData:  [],
+    filters:       {},
+    sortCol:       null,
+    sortDir:       'asc',
+    csvUrl:        null,
+    title:         '',
+    sparkCharts:   {},
+    panelOpen:     null,
+    scrollTop:     0,
+    globalSearch:  '',
+    colWidths:     [],   // computed widths per column, shared between strip & header
   };
 
-  /* ── CSV PARSER ── */
+  /* ═══════════════════════════════════════════════════════════════════
+     CSV PARSER
+  ═══════════════════════════════════════════════════════════════════ */
   function parseCSV(text) {
     const lines = text.split(/\r?\n/);
     if (lines.length < 2) return { headers: [], rows: [] };
-    const headers = splitLine(lines[0]);
+    const headers = splitCSVLine(lines[0]);
     const rows = [];
     for (let i = 1; i < lines.length; i++) {
       if (!lines[i].trim()) continue;
-      const vals = splitLine(lines[i]);
-      const obj  = {};
+      const vals = splitCSVLine(lines[i]);
+      const obj = {};
       headers.forEach((h, j) => { obj[h] = vals[j] ?? ''; });
       rows.push(obj);
     }
     return { headers, rows };
   }
-  function splitLine(line) {
-    const r = []; let cur = '', inQ = false;
-    for (const ch of line) {
+
+  function splitCSVLine(line) {
+    const result = [];
+    let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
       if (ch === '"') { inQ = !inQ; continue; }
-      if (ch === ',' && !inQ) { r.push(cur.trim()); cur = ''; continue; }
+      if (ch === ',' && !inQ) { result.push(cur.trim()); cur = ''; continue; }
       cur += ch;
     }
-    r.push(cur.trim()); return r;
+    result.push(cur.trim());
+    return result;
   }
 
-  /* ── TYPE DETECTION ── */
+  /* ═══════════════════════════════════════════════════════════════════
+     TYPE DETECTION & STATS
+  ═══════════════════════════════════════════════════════════════════ */
   function detectColumns(headers, rows) {
     return headers.map(name => {
-      const vals    = rows.map(r => r[name]).filter(v => v !== '' && v != null);
+      const vals = rows.map(r => r[name]).filter(v => v !== '' && v !== null && v !== undefined);
       const numVals = vals.map(v => parseFloat(v)).filter(v => !isNaN(v));
-      const isNum   = numVals.length / Math.max(vals.length, 1) > 0.85;
-      if (isNum) {
+      const isNumeric = numVals.length / Math.max(vals.length, 1) > 0.85;
+
+      if (isNumeric) {
         numVals.sort((a, b) => a - b);
-        const min = numVals[0] ?? 0, max = numVals[numVals.length - 1] ?? 0;
-        const mean = numVals.reduce((a, b) => a + b, 0) / (numVals.length || 1);
-        const mid  = Math.floor(numVals.length / 2);
+        const min    = numVals[0] ?? 0;
+        const max    = numVals[numVals.length - 1] ?? 0;
+        const mean   = numVals.reduce((a, b) => a + b, 0) / (numVals.length || 1);
+        const mid    = Math.floor(numVals.length / 2);
         const median = numVals.length % 2 === 0
-          ? (numVals[mid - 1] + numVals[mid]) / 2 : numVals[mid];
-        return { name, type: 'numeric', uniqueVals: [],
-          stats: { min, max, mean, median, nullCount: rows.length - vals.length, hist: buildHist(numVals, 12) } };
+          ? (numVals[mid - 1] + numVals[mid]) / 2
+          : numVals[mid];
+        const nullCount = rows.length - vals.length;
+        const hist = buildHistogram(numVals, 10);
+        return { name, type: 'numeric', stats: { min, max, mean, median, nullCount, hist }, uniqueVals: [] };
+      } else {
+        const freq = {};
+        vals.forEach(v => { freq[v] = (freq[v] || 0) + 1; });
+        const uniqueVals = Object.entries(freq)
+          .sort((a, b) => b[1] - a[1])
+          .map(([val, count]) => ({ val, count }));
+        const nullCount = rows.length - vals.length;
+        return { name, type: 'string', stats: { uniqueCount: uniqueVals.length, nullCount }, uniqueVals };
       }
-      const freq = {};
-      vals.forEach(v => { freq[v] = (freq[v] || 0) + 1; });
-      const uniqueVals = Object.entries(freq).sort((a, b) => b[1] - a[1]).map(([val, count]) => ({ val, count }));
-      return { name, type: 'string', uniqueVals,
-        stats: { uniqueCount: uniqueVals.length, nullCount: rows.length - vals.length } };
     });
-  }
-  function buildHist(sorted, bins) {
-    if (!sorted.length) return { labels: [], counts: [] };
-    const mn = sorted[0], mx = sorted[sorted.length - 1];
-    const step = (mx - mn) / bins || 1;
-    const counts = new Array(bins).fill(0);
-    const labels = Array.from({ length: bins }, (_, i) => +(mn + i * step).toFixed(2));
-    sorted.forEach(v => { counts[Math.min(Math.floor((v - mn) / step), bins - 1)]++; });
-    return { labels, counts };
   }
 
-  /* ── FILTER ENGINE ── */
+  // Compute stats on currently filtered data for a numeric column
+  function computeFilteredStats(colName, filteredRows) {
+    const numVals = filteredRows
+      .map(r => parseFloat(r[colName]))
+      .filter(v => !isNaN(v));
+    if (!numVals.length) return null;
+    numVals.sort((a, b) => a - b);
+    const min    = numVals[0];
+    const max    = numVals[numVals.length - 1];
+    const mean   = numVals.reduce((a, b) => a + b, 0) / numVals.length;
+    const mid    = Math.floor(numVals.length / 2);
+    const median = numVals.length % 2 === 0
+      ? (numVals[mid - 1] + numVals[mid]) / 2
+      : numVals[mid];
+    const nullCount = filteredRows.length - numVals.length;
+    const hist = buildHistogram(numVals, 10);
+    return { min, max, mean, median, nullCount, hist };
+  }
+
+  function buildHistogram(sortedNums, bins) {
+    if (!sortedNums.length) return { bins: [], counts: [], labels: [] };
+    const min = sortedNums[0], max = sortedNums[sortedNums.length - 1];
+    const step = (max - min) / bins || 1;
+    const counts = new Array(bins).fill(0);
+    const labels = [];
+    for (let i = 0; i < bins; i++) labels.push(+(min + i * step).toFixed(2));
+    sortedNums.forEach(v => {
+      const idx = Math.min(Math.floor((v - min) / step), bins - 1);
+      counts[idx]++;
+    });
+    return { labels, counts, step, min, max };
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     COLUMN WIDTHS  (shared between stats strip & table)
+  ═══════════════════════════════════════════════════════════════════ */
+  function computeColWidths(columns, sampleRows) {
+    return columns.map(col => {
+      // Estimate based on header length + sample values
+      let maxLen = col.name.length;
+      sampleRows.slice(0, 20).forEach(r => {
+        const v = String(r[col.name] || '');
+        if (v.length > maxLen) maxLen = v.length;
+      });
+      // ~7.5px per char, capped
+      return Math.max(COL_MIN_W, Math.min(maxLen * 7.5 + COL_PAD, 260));
+    });
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     FILTER ENGINE
+  ═══════════════════════════════════════════════════════════════════ */
   function applyFilters() {
-    let data = _st.rawData;
-    if (_st.globalSearch) {
-      const q = _st.globalSearch.toLowerCase();
-      data = data.filter(r => Object.values(r).some(v => String(v).toLowerCase().includes(q)));
+    let data = _state.rawData;
+
+    if (_state.globalSearch) {
+      const q = _state.globalSearch.toLowerCase();
+      data = data.filter(row =>
+        Object.values(row).some(v => String(v).toLowerCase().includes(q))
+      );
     }
-    _st.columns.forEach(col => {
-      const f = _st.filters[col.name]; if (!f) return;
+
+    _state.columns.forEach(col => {
+      const f = _state.filters[col.name];
+      if (!f) return;
       if (col.type === 'string') {
-        if (f.selected && f.selected.length) data = data.filter(r => f.selected.includes(r[col.name]));
-        if (f.text) { const q = f.text.toLowerCase(); data = data.filter(r => String(r[col.name]).toLowerCase().includes(q)); }
+        if (f.selected && f.selected.length > 0)
+          data = data.filter(r => f.selected.includes(r[col.name]));
+        if (f.text) {
+          const q = f.text.toLowerCase();
+          data = data.filter(r => String(r[col.name]).toLowerCase().includes(q));
+        }
       } else {
-        if (f.min !== '' && f.min != null) data = data.filter(r => parseFloat(r[col.name]) >= parseFloat(f.min));
-        if (f.max !== '' && f.max != null) data = data.filter(r => parseFloat(r[col.name]) <= parseFloat(f.max));
+        if (f.min !== undefined && f.min !== '')
+          data = data.filter(r => parseFloat(r[col.name]) >= parseFloat(f.min));
+        if (f.max !== undefined && f.max !== '')
+          data = data.filter(r => parseFloat(r[col.name]) <= parseFloat(f.max));
       }
     });
-    if (_st.sortCol && _st.sortDir !== 'none') {
-      const col = _st.columns.find(c => c.name === _st.sortCol);
-      const dir = _st.sortDir === 'asc' ? 1 : -1;
+
+    if (_state.sortCol) {
+      const col = _state.columns.find(c => c.name === _state.sortCol);
+      const dir = _state.sortDir === 'asc' ? 1 : -1;
       data = [...data].sort((a, b) => {
-        const av = a[_st.sortCol], bv = b[_st.sortCol];
-        return col && col.type === 'numeric'
-          ? (parseFloat(av) - parseFloat(bv)) * dir
-          : String(av).localeCompare(String(bv)) * dir;
+        const av = a[_state.sortCol], bv = b[_state.sortCol];
+        if (col && col.type === 'numeric')
+          return (parseFloat(av) - parseFloat(bv)) * dir;
+        return String(av).localeCompare(String(bv)) * dir;
       });
     }
-    _st.filteredData = data;
+
+    _state.filteredData = data;
   }
 
-  /* ── COLUMN WIDTHS ── */
-  function computeColWidths() {
-    _st.colWidths = _st.columns.map(col =>
-      Math.max(COL_MIN_W, Math.min(col.name.length * 8 + 90, 260))
-    );
-  }
+  /* ═══════════════════════════════════════════════════════════════════
+     VIRTUAL SCROLL RENDERER
+  ═══════════════════════════════════════════════════════════════════ */
+  function renderVirtualRows(tableBody, scrollContainer) {
+    const data   = _state.filteredData;
+    const cols   = _state.columns;
+    const viewH  = scrollContainer.clientHeight;
+    const scrollT = scrollContainer.scrollTop;
 
-  /* ── VIRTUAL ROWS ── */
-  function renderVirtualRows(tbody, cont) {
-    const data = _st.filteredData, cols = _st.columns;
-    const sTop = cont.scrollTop, viewH = cont.clientHeight;
-    const s    = Math.max(0, Math.floor(sTop / VIRTUAL_ROW_H) - VIRTUAL_BUFFER);
-    const e    = Math.min(data.length, s + Math.ceil(viewH / VIRTUAL_ROW_H) + VIRTUAL_BUFFER * 2);
-    const topH = s * VIRTUAL_ROW_H, botH = (data.length - e) * VIRTUAL_ROW_H;
-    let html   = `<tr style="height:${topH}px"><td colspan="${cols.length}" style="padding:0;border:none"></td></tr>`;
-    for (let i = s; i < e; i++) {
+    const startIdx = Math.max(0, Math.floor(scrollT / VIRTUAL_ROW_H) - VIRTUAL_BUFFER);
+    const endIdx   = Math.min(data.length, startIdx + Math.ceil(viewH / VIRTUAL_ROW_H) + VIRTUAL_BUFFER * 2);
+
+    const topH = startIdx * VIRTUAL_ROW_H;
+    const botH = (data.length - endIdx) * VIRTUAL_ROW_H;
+
+    let html = `<tr style="height:${topH}px"><td colspan="${cols.length}" style="padding:0;border:none"></td></tr>`;
+
+    for (let i = startIdx; i < endIdx; i++) {
       const row = data[i];
-      html += `<tr class="dt-row ${i % 2 === 0 ? 'dt-re' : 'dt-ro'}">`;
+      const bg = i % 2 === 0 ? '#fff' : '#F7F9FC';
+      html += `<tr class="dt-row" style="background:${bg}">`;
       cols.forEach((col, ci) => {
-        const w = _st.colWidths[ci];
-        const v = row[col.name] ?? '';
-        html += `<td class="dt-cell" style="width:${w}px;min-width:${w}px;max-width:${w}px" title="${esc(String(v))}">${v === '' ? '<span class="dt-null">—</span>' : esc(String(v))}</td>`;
+        const val = row[col.name] ?? '';
+        const display = val === '' ? '<span class="dt-null">—</span>' : esc(String(val));
+        const w = _state.colWidths[ci] || COL_MIN_W;
+        html += `<td class="dt-cell" style="min-width:${w}px;max-width:${w}px;width:${w}px;" title="${esc(String(val))}">${display}</td>`;
       });
       html += '</tr>';
     }
+
     html += `<tr style="height:${botH}px"><td colspan="${cols.length}" style="padding:0;border:none"></td></tr>`;
-    tbody.innerHTML = html;
+    tableBody.innerHTML = html;
   }
 
-  /* ── SVG ICONS ── */
-  function iconFilter(active) {
-    const c = active ? '#2979D9' : '#7A8BA8';
-    return `<svg width="13" height="13" viewBox="0 0 20 20" fill="none" stroke="${c}" stroke-width="1.8" stroke-linecap="round">
-      <line x1="2" y1="5"  x2="18" y2="5"/><circle cx="7"  cy="5"  r="2" fill="${c}" stroke="none"/>
-      <line x1="2" y1="10" x2="18" y2="10"/><circle cx="13" cy="10" r="2" fill="${c}" stroke="none"/>
-      <line x1="2" y1="15" x2="18" y2="15"/><circle cx="9"  cy="15" r="2" fill="${c}" stroke="none"/>
-    </svg>`;
-  }
-
-  function iconSort(colName) {
-    const active = _st.sortCol === colName;
-    const dir    = active ? _st.sortDir : 'none';
-    if (dir === 'asc')  return `<svg width="13" height="13" viewBox="0 0 20 20" fill="none" stroke="#2979D9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" title="Ascending"><path d="M10 4l-4 5h8l-4-5z" fill="#2979D9" stroke="none"/><line x1="5" y1="15" x2="15" y2="15" stroke="#2979D9"/></svg>`;
-    if (dir === 'desc') return `<svg width="13" height="13" viewBox="0 0 20 20" fill="none" stroke="#2979D9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" title="Descending"><path d="M10 16l4-5H6l4 5z" fill="#2979D9" stroke="none"/><line x1="5" y1="5" x2="15" y2="5" stroke="#2979D9"/></svg>`;
-    return `<svg width="13" height="13" viewBox="0 0 20 20" fill="none" title="Sort"><path d="M10 4l-3 4h6z" fill="rgba(100,130,180,0.4)"/><path d="M10 16l3-4H7z" fill="rgba(100,130,180,0.4)"/></svg>`;
-  }
-
-  /* ── HEADER ── */
-  function renderHeader() {
-    const thead = document.getElementById('sdt-thead');
-    if (!thead) return;
-    let html = '<tr>';
-    _st.columns.forEach((col, ci) => {
-      const w   = _st.colWidths[ci];
-      const cls = col.type === 'numeric' ? 'numeric' : 'string';
-      html += `<th class="dt-th" style="width:${w}px;min-width:${w}px;max-width:${w}px">
-        <div class="dt-thi">
-          <span class="dt-tb ${cls}">${col.type === 'numeric' ? 'NUM' : 'STR'}</span>
-          <span class="dt-thn" title="${esc(col.name)}">${esc(col.name)}</span>
-          <button class="dt-sort-btn" title="Sort" onclick="SarthiDatatable._sortBy('${esc(col.name)}')">${iconSort(col.name)}</button>
-          <button class="dt-filt-btn${hasActiveFilter(col.name) ? ' on' : ''}" title="Filter"
-            onclick="event.stopPropagation();SarthiDatatable._openFP('${esc(col.name)}',this)">${iconFilter(hasActiveFilter(col.name))}</button>
-        </div></th>`;
-    });
-    thead.innerHTML = html + '</tr>';
-  }
-
-  /* ── STATS STRIP ── */
-  function renderStatsStrip() {
-    const strip = document.getElementById('sdt-stats-strip');
-    if (!strip) return;
-    Object.values(_st.sparkCharts).forEach(c => { try { c.destroy(); } catch {} });
-    _st.sparkCharts = {};
-
-    let html = '<div style="display:flex;width:max-content;">';
-    _st.columns.forEach((col, ci) => {
-      const w = _st.colWidths[ci];
-      if (col.type === 'numeric') {
-        const s = col.stats;
-        html += `<div class="dt-sc" style="width:${w}px;min-width:${w}px;max-width:${w}px">
-          <div class="dt-smr">
-            <span class="dt-mv teal" title="Min">↓${fmt(s.min)}</span>
-            <span class="dt-mv blue" title="Max">↑${fmt(s.max)}</span>
-            ${s.nullCount ? `<span class="dt-mv muted">${s.nullCount}∅</span>` : ''}
-          </div>
-          <div class="dt-sw" id="sdt-sw-${ci}">
-            <canvas id="sdt-sp-${ci}" style="display:block;width:100%;height:100%"></canvas>
-            <div class="dt-spk-tt" id="sdt-tt-${ci}"></div>
-          </div>
-          <div class="dt-sl"><span>${esc(fmt(s.min))}</span><span>${esc(fmt(s.max))}</span></div>
-        </div>`;
-      } else {
-        const s = col.stats;
-        const t = (col.uniqueVals || []).slice(0, 2).map(u => esc(u.val)).join(', ');
-        html += `<div class="dt-sc" style="width:${w}px;min-width:${w}px;max-width:${w}px">
-          <div class="dt-smr"><span class="dt-mv purple">${s.uniqueCount} unique</span>${s.nullCount ? `<span class="dt-mv muted">${s.nullCount}∅</span>` : ''}</div>
-          <div class="dt-stop3" title="${t}">${t || '—'}</div>
-        </div>`;
-      }
-    });
-    html += '</div>';
-    strip.innerHTML = html;
-
-    requestAnimationFrame(() => {
-      _st.columns.forEach((col, ci) => { if (col.type === 'numeric') drawSpark(col, ci); });
-    });
-  }
-
-  /* ── SPARKLINE with dotted mean/median lines ── */
-  function drawSpark(col, ci) {
-    if (!global.Chart) return;
-    const canvas = document.getElementById(`sdt-sp-${ci}`);
-    if (!canvas) return;
-    const s = col.stats, h = s.hist;
-    if (!h.counts || !h.counts.length) return;
-
-    const mn    = s.min, mx = s.max, range = mx - mn || 1;
-    const bins  = h.counts.length;
-    const meanX = ((s.mean   - mn) / range) * (bins - 1);
-    const medX  = ((s.median - mn) / range) * (bins - 1);
-
-    const annotPlugin = {
-      id: 'sdtA',
-      afterDraw(chart) {
-        const ctx = chart.ctx, xs = chart.scales.x, ys = chart.scales.y;
-        [[meanX, 'rgba(91,163,245,0.9)'], [medX, 'rgba(112,102,212,0.9)']].forEach(([xv, color]) => {
-          const px = xs.getPixelForValue(xv);
-          ctx.save(); ctx.beginPath(); ctx.setLineDash([2.5, 2.5]);
-          ctx.strokeStyle = color; ctx.lineWidth = 1.5;
-          ctx.moveTo(px, ys.top); ctx.lineTo(px, ys.bottom);
-          ctx.stroke(); ctx.restore();
-        });
-      },
-    };
-
-    const hoverPlugin = {
-      id: 'sdtH',
-      afterEvent(chart, args) {
-        const tip = document.getElementById(`sdt-tt-${ci}`);
-        const sw  = document.getElementById(`sdt-sw-${ci}`);
-        if (!tip || !sw) return;
-        const ev  = args.event;
-        if (ev.type === 'mouseleave') { tip.style.display = 'none'; return; }
-        if (ev.type !== 'mousemove')  return;
-        const pts = chart.getElementsAtEventForMode(ev.native, 'index', { intersect: false }, true);
-        if (!pts.length) { tip.style.display = 'none'; return; }
-        const idx   = pts[0].index;
-        const binLo = fmt(h.labels[idx]);
-        const binHi = fmt(h.labels[idx + 1] ?? s.max);
-        tip.innerHTML = `
-          <div style="font-size:10px;font-weight:600;color:#fff;margin-bottom:1px;">${binLo} – ${binHi}</div>
-          <div style="font-size:9.5px;color:#C8E2FF;">${h.counts[idx]} values</div>
-          <div style="font-size:9px;margin-top:3px;">
-            <span style="color:rgba(91,163,245,0.95);">— mean ${fmt(s.mean)}</span><br>
-            <span style="color:rgba(180,170,240,0.95);">— median ${fmt(s.median)}</span>
-          </div>`;
-        tip.style.display = 'block';
-        const wr  = sw.getBoundingClientRect();
-        const ex  = ev.native.clientX - wr.left;
-        tip.style.left = (ex > wr.width / 2 ? ex - 125 : ex + 6) + 'px';
-        tip.style.top  = '0px';
-      },
-    };
-
-    try {
-      _st.sparkCharts[ci] = new global.Chart(canvas, {
-        type: 'bar', plugins: [annotPlugin, hoverPlugin],
-        data: {
-          labels:   h.counts.map((_, i) => i),
-          datasets: [{ data: h.counts, backgroundColor: 'rgba(91,163,245,0.35)',
-            borderColor: 'rgba(41,121,217,0.5)', borderWidth: 1,
-            borderRadius: 2, borderSkipped: false }],
-        },
-        options: {
-          responsive: true, maintainAspectRatio: false, animation: false,
-          events: ['mousemove', 'mouseleave'],
-          plugins: { legend: { display: false }, tooltip: { enabled: false } },
-          scales: { x: { display: false }, y: { display: false, beginAtZero: true } },
-          layout: { padding: { top: 1, bottom: 0, left: 0, right: 0 } },
-        },
-      });
-    } catch (err) { console.warn('spark err', err); }
-  }
-
-  /* ── FULL BUILD (called once after data loads) ── */
-  function buildFull() {
-    computeColWidths();
-    renderStatsStrip();
-    renderHeader();
-    const tbody = document.getElementById('sdt-tbody');
-    const cont  = document.getElementById('sdt-table-container');
-    if (tbody && cont) renderVirtualRows(tbody, cont);
-    renderChips(); updateStatus();
-    // Sync horizontal scroll
-    if (cont) {
-      cont.addEventListener('scroll', () => {
-        const strip = document.getElementById('sdt-stats-strip');
-        if (strip) strip.scrollLeft = cont.scrollLeft;
-        const tb = document.getElementById('sdt-tbody');
-        if (tb) renderVirtualRows(tb, cont);
-      }, { passive: true });
-    }
-  }
-
-  function refresh() {
-    applyFilters(); renderHeader();
-    const tbody = document.getElementById('sdt-tbody');
-    const cont  = document.getElementById('sdt-table-container');
-    if (tbody && cont) renderVirtualRows(tbody, cont);
-    renderChips(); updateStatus();
-  }
-
-  /* ── FILTER PANEL ── */
-  function openFP(colName, btn) {
-    const col   = _st.columns.find(c => c.name === colName);
-    const panel = document.getElementById('sdt-fp');
-    if (!col || !panel) return;
-    if (_st.panelOpen === colName) { closeFP(); return; }
-    _st.panelOpen = colName;
-    const r  = btn.getBoundingClientRect();
-    panel.style.left    = Math.min(r.left, window.innerWidth - 265) + 'px';
-    panel.style.top     = (r.bottom + 5) + 'px';
-    panel.style.display = 'block';
-    col.type === 'string' ? renderSFP(col, panel) : renderNFP(col, panel);
-    setTimeout(() => document.addEventListener('click', outsideFP, { once: true }), 10);
-  }
-  function outsideFP(e) {
-    const p = document.getElementById('sdt-fp');
-    if (p && !p.contains(e.target)) closeFP();
-  }
-  function closeFP() {
-    const p = document.getElementById('sdt-fp');
-    if (p) p.style.display = 'none';
-    _st.panelOpen = null;
-  }
-
-  function renderSFP(col, panel) {
-    const f  = _st.filters[col.name] || {};
-    const tx = f.text || '', sel = f.selected || [];
-    const all = col.uniqueVals.slice(0, 300);
-    const vis = tx ? all.filter(u => u.val.toLowerCase().includes(tx.toLowerCase())) : all;
-    panel.innerHTML = `
-      <div style="padding:8px 12px 6px;border-bottom:1px solid rgba(100,130,180,0.09);display:flex;align-items:center;justify-content:space-between;">
-        <span style="font-size:11px;font-weight:600;color:#1A2535;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:155px">${esc(col.name)}</span>
-        <span style="font-size:10px;color:#7A8BA8">${col.stats.uniqueCount} unique</span>
-      </div>
-      <div style="padding:7px 12px;border-bottom:1px solid rgba(100,130,180,0.09)">
-        <div style="font-size:9.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#7A8BA8;margin-bottom:4px">Search</div>
-        <input style="width:100%;padding:5px 8px;font-size:11.5px;font-family:'DM Sans',sans-serif;border:1.5px solid rgba(100,130,180,0.22);border-radius:7px;background:#F7F9FC;color:#1A2535;outline:none;box-sizing:border-box"
-          id="sdt-ss" value="${esc(tx)}" placeholder="Type to filter…"
-          onfocus="this.style.borderColor='#5BA3F5'" onblur="this.style.borderColor='rgba(100,130,180,0.22)'"
-          oninput="SarthiDatatable._sSC('${esc(col.name)}',this.value)"/>
-      </div>
-      <div style="max-height:190px;overflow-y:auto;padding:4px 8px">
-        ${sel.length ? `<div style="display:flex;justify-content:space-between;padding:2px 4px 4px;font-size:10px;color:#7A8BA8">
-          <span>${sel.length} selected</span>
-          <button onclick="SarthiDatatable._clrC('${esc(col.name)}')" style="color:#5BA3F5;background:none;border:none;cursor:pointer;font-family:'DM Sans',sans-serif;font-size:10px">Clear</button>
-        </div>` : ''}
-        ${vis.map(u => `<div style="display:flex;align-items:center;gap:7px;padding:4px 6px;cursor:pointer;border-radius:5px;font-size:12px;color:#1A2535;transition:background .09s"
-          onmouseover="this.style.background='#F0F4FF'" onmouseout="this.style.background=''">
-          <input type="checkbox" ${sel.includes(u.val) ? 'checked' : ''} style="accent-color:#2979D9;width:12px;height:12px;flex-shrink:0"
-            onchange="SarthiDatatable._tVF('${esc(col.name)}','${esc(u.val)}')"/>
-          <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(u.val)}">${esc(u.val)}</span>
-          <span style="font-size:9.5px;color:#7A8BA8;flex-shrink:0">${u.count}</span>
-        </div>`).join('')}
-        ${!vis.length ? '<div style="text-align:center;padding:10px;font-size:11.5px;color:#7A8BA8">No matches</div>' : ''}
-      </div>`;
-  }
-
-  function renderNFP(col, panel) {
-    const f = _st.filters[col.name] || {}, s = col.stats;
-    panel.innerHTML = `
-      <div style="padding:8px 12px 6px;border-bottom:1px solid rgba(100,130,180,0.09);display:flex;align-items:center;justify-content:space-between;">
-        <span style="font-size:11px;font-weight:600;color:#1A2535">${esc(col.name)}</span>
-        <span style="font-size:10px;color:#1A8C78">numeric</span>
-      </div>
-      <div style="padding:8px 12px;border-bottom:1px solid rgba(100,130,180,0.09)">
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
-          ${['Min','Max'].map((lbl,i) => {
-            const id = i===0?'sdt-nm':'sdt-nx', key = i===0?'min':'max';
-            return `<div><div style="font-size:9.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#7A8BA8;margin-bottom:3px">${lbl}</div>
-              <input type="number" id="${id}" style="width:100%;padding:5px 7px;font-size:11.5px;font-family:'DM Sans',sans-serif;border:1.5px solid rgba(100,130,180,0.22);border-radius:7px;background:#F7F9FC;color:#1A2535;outline:none;box-sizing:border-box"
-                placeholder="${fmt(s[key==='min'?'min':'max'])}" value="${f[key] ?? ''}"
-                onfocus="this.style.borderColor='#5BA3F5'" onblur="this.style.borderColor='rgba(100,130,180,0.22)'"
-                oninput="SarthiDatatable._nFC('${esc(col.name)}')"/></div>`;
-          }).join('')}
-        </div>
-      </div>
-      <div style="padding:7px 12px;border-bottom:1px solid rgba(100,130,180,0.09)">
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;text-align:center;font-size:11px">
-          <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;color:#7A8BA8;margin-bottom:2px">Range</div>
-            <div style="color:#1A8C78">↓ ${fmt(s.min)}</div><div style="color:#2979D9">↑ ${fmt(s.max)}</div></div>
-          <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;color:#7A8BA8;margin-bottom:2px">Central</div>
-            <div style="color:#2979D9">μ ${fmt(s.mean)}</div><div style="color:#7066D4">M ${fmt(s.median)}</div></div>
-        </div>
-      </div>
-      <div style="padding:6px 12px 10px">
-        <button onclick="SarthiDatatable._clrC('${esc(col.name)}')"
-          style="width:100%;padding:5px;font-size:11px;font-family:'DM Sans',sans-serif;border:1px solid rgba(100,130,180,0.2);border-radius:7px;background:transparent;color:#7A8BA8;cursor:pointer;transition:background .12s"
-          onmouseover="this.style.background='#F0F4FF';this.style.color='#1A2535'"
-          onmouseout="this.style.background='transparent';this.style.color='#7A8BA8'">Clear filter</button>
-      </div>`;
-  }
-
-  /* ── CHIPS ── */
-  function renderChips() {
-    const el = document.getElementById('sdt-chips');
-    if (!el) return;
-    const anyF = Object.keys(_st.filters).some(k => hasActiveFilter(k));
-    if (!anyF && !_st.globalSearch) { el.style.display = 'none'; el.innerHTML = ''; return; }
-    el.style.display = 'flex';
-    let h = '';
-    if (_st.globalSearch) h += mkChip(`Search: "${esc(_st.globalSearch)}"`, `SarthiDatatable._clrG()`);
-    Object.entries(_st.filters).forEach(([cn, f]) => {
-      const col = _st.columns.find(c => c.name === cn); if (!col) return;
-      const clr = `SarthiDatatable._clrC('${esc(cn)}')`;
-      if (col.type === 'string') {
-        if (f.selected && f.selected.length) h += mkChip(`${esc(cn)}: ${f.selected.length === 1 ? esc(f.selected[0]) : f.selected.length + ' values'}`, clr);
-        if (f.text) h += mkChip(`${esc(cn)} ∋ "${esc(f.text)}"`, clr);
-      } else {
-        if (f.min !== '' && f.min != null) h += mkChip(`${esc(cn)} ≥ ${fmt(f.min)}`, clr);
-        if (f.max !== '' && f.max != null) h += mkChip(`${esc(cn)} ≤ ${fmt(f.max)}`, clr);
-      }
-    });
-    el.innerHTML = h;
-  }
-  function mkChip(label, clrFn) {
-    return `<span style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px 2px 9px;border-radius:20px;font-size:10.5px;font-weight:500;background:#EBF4FF;color:#1A4F9C;border:1px solid #C8E2FF">
-      ${label}
-      <button onclick="${clrFn}" style="display:flex;align-items:center;justify-content:center;width:13px;height:13px;border-radius:50%;border:none;background:rgba(41,121,217,0.14);color:#2979D9;cursor:pointer;font-size:10px;line-height:1">×</button>
-    </span>`;
-  }
-
-  function updateStatus() {
-    const total = _st.rawData.length, shown = _st.filteredData.length;
-    const txt   = shown < total ? `${shown.toLocaleString()} of ${total.toLocaleString()} rows · ${_st.columns.length} cols`
-                                 : `${total.toLocaleString()} rows · ${_st.columns.length} cols`;
-    ['sdt-status-left','sdt-row-count'].forEach(id => { const el = document.getElementById(id); if (el) el.textContent = txt; });
-  }
-
-  function showLoading(msg) {
-    const tb = document.getElementById('sdt-tbody');
-    if (!tb) return;
-    tb.innerHTML = `<tr><td colspan="100" style="text-align:center;padding:60px 20px;color:#7A8BA8;font-size:13px">
-      <div style="display:flex;justify-content:center;gap:5px;margin-bottom:10px">
-        ${[0,0.2,0.4].map(d=>`<div style="width:5px;height:5px;border-radius:50%;background:#5BA3F5;animation:sdtP 1.2s ${d}s ease-in-out infinite"></div>`).join('')}
-      </div>${esc(msg)}
-      <style>@keyframes sdtP{0%,80%,100%{transform:scale(.8);opacity:.4}40%{transform:scale(1.2);opacity:1}}</style>
-    </td></tr>`;
-  }
-
-  function ensureChartJS(cb) {
-    if (global.Chart) { cb(); return; }
-    const s = document.createElement('script');
-    s.src = CHARTJS_CDN; s.onload = s.onerror = cb;
-    document.head.appendChild(s);
-  }
-
-  /* ── HELPERS ── */
-  function hasActiveFilter(cn) {
-    const f = _st.filters[cn]; if (!f) return false;
-    return !!(f.selected && f.selected.length) || !!f.text ||
-           (f.min !== '' && f.min != null) || (f.max !== '' && f.max != null);
-  }
-  function fmt(n) {
-    if (n === undefined || n === null) return '—';
-    const v = parseFloat(n); if (isNaN(v)) return '—';
-    if (Math.abs(v) >= 1e6)  return (v/1e6).toFixed(2)+'M';
-    if (Math.abs(v) >= 1e3)  return (v/1e3).toFixed(1)+'K';
-    return Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2);
-  }
-  function esc(s) {
-    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-                        .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-  }
-
-  /* ── MODAL HTML ── */
-  function buildModalHTML() { return `
-<div id="sdt-overlay" style="display:none;position:fixed;inset:0;z-index:2000;background:rgba(15,25,50,0.50);backdrop-filter:blur(4px);align-items:flex-end;justify-content:center">
-<div id="sdt-modal" style="background:#F4F7FC;border-radius:18px 18px 0 0;width:100%;height:91vh;display:flex;flex-direction:column;box-shadow:0 -10px 40px rgba(15,25,50,0.16);overflow:hidden;animation:sdtSU .24s cubic-bezier(.22,1,.36,1)">
+  /* ═══════════════════════════════════════════════════════════════════
+     MODAL HTML
+  ═══════════════════════════════════════════════════════════════════ */
+  function buildModalHTML() {
+    return `
+<div id="sdt-overlay" style="
+  display:none; position:fixed; inset:0; z-index:2000;
+  background:rgba(15,25,50,0.52); backdrop-filter:blur(4px);
+  align-items:flex-end; justify-content:center; padding:0;
+">
+<div id="sdt-modal" style="
+  background:#F4F7FC; border-radius:16px 16px 0 0;
+  width:100%; height:92vh; display:flex; flex-direction:column;
+  box-shadow:0 -8px 40px rgba(15,25,50,0.18);
+  overflow:hidden;
+">
 
   <!-- TOP BAR -->
-  <div style="display:flex;align-items:center;gap:10px;padding:8px 18px 7px;background:#fff;border-bottom:1px solid rgba(100,130,180,0.13);flex-shrink:0">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="#7A8BA8"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>
-    <span id="sdt-title" style="font-size:12.5px;font-weight:500;color:#4A5E7A;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
-    <span id="sdt-row-count" style="font-size:11px;color:#7A8BA8;padding:2px 8px;background:#F7F9FC;border:1px solid rgba(100,130,180,0.13);border-radius:20px;white-space:nowrap;flex-shrink:0"></span>
-    <div style="position:relative;flex-shrink:0">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="#7A8BA8" style="position:absolute;left:8px;top:50%;transform:translateY(-50%);pointer-events:none"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-      <input id="sdt-gs" placeholder="Search all columns…" style="padding:5px 10px 5px 26px;font-size:12px;font-family:'DM Sans',sans-serif;border:1.5px solid rgba(100,130,180,0.22);border-radius:20px;background:#F7F9FC;color:#1A2535;outline:none;width:185px;transition:border-color .15s,box-shadow .15s"
-        onfocus="this.style.borderColor='#5BA3F5';this.style.boxShadow='0 0 0 3px rgba(59,130,246,0.08)'"
-        onblur="this.style.borderColor='rgba(100,130,180,0.22)';this.style.boxShadow='none'"/>
+  <div id="sdt-topbar" style="
+    display:flex; align-items:center; gap:10px; padding:8px 16px 7px;
+    background:#fff; border-bottom:1px solid rgba(100,130,180,0.13);
+    flex-shrink:0;
+  ">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="color:#7A8BA8;flex-shrink:0">
+      <path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>
+    </svg>
+    <span id="sdt-title" style="font-size:12.5px;font-weight:500;color:#4A5E7A;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;max-width:320px;"></span>
+    <span id="sdt-row-count" style="
+      font-size:10.5px; color:#7A8BA8; padding:2px 8px;
+      background:#F7F9FC; border:1px solid rgba(100,130,180,0.13);
+      border-radius:20px; white-space:nowrap; flex-shrink:0;
+    "></span>
+
+    <div style="flex:1"></div>
+
+    <!-- Global search -->
+    <div style="position:relative;flex-shrink:0;">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" style="
+        position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#7A8BA8;pointer-events:none;
+      "><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      <input id="sdt-global-search" placeholder="Search all columns…" style="
+        padding:5px 10px 5px 26px; font-size:12px; font-family:'DM Sans',sans-serif;
+        border:1.5px solid rgba(100,130,180,0.22); border-radius:20px;
+        background:#F7F9FC; color:#1A2535; outline:none; width:190px;
+      "
+        onfocus="this.style.borderColor='#5BA3F5';this.style.boxShadow='0 0 0 2px rgba(59,130,246,0.08)'"
+        onblur="this.style.borderColor='rgba(100,130,180,0.22)';this.style.boxShadow='none'"
+      />
     </div>
-    <button onclick="SarthiDatatable._resetAll()" style="padding:4px 11px;font-size:11px;font-family:'DM Sans',sans-serif;font-weight:500;border:1px solid rgba(100,130,180,0.22);border-radius:20px;background:transparent;color:#7A8BA8;cursor:pointer;flex-shrink:0;transition:background .12s,color .12s"
-      onmouseover="this.style.background='#EEF2F8';this.style.color='#1A2535'" onmouseout="this.style.background='transparent';this.style.color='#7A8BA8'">Reset</button>
-    <button onclick="SarthiDatatable.close()" title="Close" style="width:26px;height:26px;border-radius:7px;border:1px solid rgba(100,130,180,0.22);background:transparent;color:#7A8BA8;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:background .12s,color .12s"
-      onmouseover="this.style.background='#EEF2F8';this.style.color='#1A2535'" onmouseout="this.style.background='transparent';this.style.color='#7A8BA8'">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg>
+
+    <button id="sdt-reset-btn" onclick="SarthiDatatable._resetAll()" style="
+      padding:4px 11px; font-size:11px; font-family:'DM Sans',sans-serif; font-weight:500;
+      border:1px solid rgba(100,130,180,0.22); border-radius:20px;
+      background:transparent; color:#7A8BA8; cursor:pointer; flex-shrink:0;
+    "
+      onmouseover="this.style.background='#EEF2F8';this.style.color='#1A2535'"
+      onmouseout="this.style.background='transparent';this.style.color='#7A8BA8'"
+    >Reset filters</button>
+
+    <button onclick="SarthiDatatable.close()" style="
+      width:26px; height:26px; border-radius:7px; border:1px solid rgba(100,130,180,0.22);
+      background:transparent; color:#7A8BA8; display:flex; align-items:center; justify-content:center;
+      cursor:pointer; flex-shrink:0;
+    "
+      onmouseover="this.style.background='#EEF2F8'"
+      onmouseout="this.style.background='transparent'"
+    >
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <path d="M18 6L6 18M6 6l12 12"/>
+      </svg>
     </button>
   </div>
 
-  <!-- CHIPS -->
-  <div id="sdt-chips" style="display:none;flex-wrap:wrap;gap:5px;padding:5px 18px;background:#fff;border-bottom:1px solid rgba(100,130,180,0.09);flex-shrink:0"></div>
+  <!-- ACTIVE FILTER CHIPS -->
+  <div id="sdt-chips" style="
+    display:none; flex-wrap:wrap; gap:5px; padding:5px 16px;
+    background:#fff; border-bottom:1px solid rgba(100,130,180,0.10);
+    flex-shrink:0;
+  "></div>
 
   <!-- BODY -->
-  <div style="display:flex;flex-direction:column;flex:1;overflow:hidden;min-height:0">
+  <div style="display:flex;flex-direction:column;flex:1;overflow:hidden;min-height:0;">
 
-    <!-- Stats strip: overflow hidden, synced by JS -->
-    <div id="sdt-stats-strip" style="overflow:hidden;flex-shrink:0;background:#fff;border-bottom:1px solid rgba(100,130,180,0.13);scrollbar-width:none"></div>
-
-    <!-- Table -->
-    <div id="sdt-table-container" style="flex:1;overflow:auto;min-height:0;scrollbar-width:thin;scrollbar-color:rgba(100,130,180,0.22) transparent">
-      <table id="sdt-table" style="border-collapse:collapse;width:max-content;min-width:100%;font-size:12.5px;font-family:'DM Sans',sans-serif;table-layout:fixed">
-        <thead id="sdt-thead" style="position:sticky;top:0;z-index:10"></thead>
+    <!-- TABLE CONTAINER (stats strip is INSIDE the scrollable header area) -->
+    <div id="sdt-table-container" style="
+      flex:1; overflow:auto; min-height:0;
+      scrollbar-width:thin; scrollbar-color:rgba(100,130,180,0.25) transparent;
+    ">
+      <table id="sdt-table" style="
+        border-collapse:collapse; min-width:max-content;
+        font-size:12.5px; font-family:'DM Sans',sans-serif;
+      ">
+        <!-- Stats strip as first header row -->
+        <thead id="sdt-thead" style="position:sticky;top:0;z-index:10;"></thead>
         <tbody id="sdt-tbody"></tbody>
       </table>
     </div>
+
   </div>
 
-  <!-- BOTTOM STATUS -->
-  <div style="display:flex;align-items:center;justify-content:space-between;padding:5px 18px;background:#fff;border-top:1px solid rgba(100,130,180,0.11);flex-shrink:0;font-size:11px;color:#7A8BA8">
+  <!-- STATUS BAR -->
+  <div style="
+    display:flex; align-items:center; justify-content:space-between;
+    padding:5px 16px; background:#fff; border-top:1px solid rgba(100,130,180,0.13);
+    flex-shrink:0; font-size:11px; color:#7A8BA8;
+  ">
     <span id="sdt-status-left"></span>
-    <span style="opacity:.6">Sarthi Datatable</span>
+    <span style="font-size:10.5px;opacity:0.6;">Sarthi Datatable</span>
   </div>
 </div>
 </div>
 
 <!-- Filter panel -->
-<div id="sdt-fp" style="display:none;position:fixed;z-index:3000;background:#fff;border:1px solid rgba(100,130,180,0.22);border-radius:12px;box-shadow:0 8px 28px rgba(15,25,50,0.13);width:255px;overflow:hidden;animation:sdtFI .14s ease"></div>
+<div id="sdt-filter-panel" style="
+  display:none; position:fixed; z-index:3000;
+  background:#fff; border:1px solid rgba(100,130,180,0.22);
+  border-radius:10px; box-shadow:0 6px 24px rgba(15,25,50,0.13);
+  width:250px; overflow:hidden;
+"></div>
 
 <style>
-@keyframes sdtFI  { from{opacity:0} to{opacity:1} }
-@keyframes sdtSU  { from{transform:translateY(36px);opacity:0} to{transform:translateY(0);opacity:1} }
+.dt-row { transition:background 0.07s; }
+.dt-row:hover td { background:rgba(91,163,245,0.05) !important; }
+.dt-cell {
+  padding:7px 12px; border-bottom:1px solid rgba(100,130,180,0.08);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  color:#1A2535; vertical-align:middle; box-sizing:border-box;
+}
+.dt-null { color:#C4CFDF; font-style:italic; }
 
-.dt-re td { background:#fff }
-.dt-ro td { background:#F7F9FC }
-.dt-row:hover td { background:rgba(91,163,245,0.05) !important }
-.dt-cell { padding:7px 12px;border-bottom:1px solid rgba(100,130,180,0.08);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#1A2535;vertical-align:middle;box-sizing:border-box }
-.dt-null { color:#C4CFDF;font-style:italic }
+/* Stats strip row */
+.dt-stats-row td {
+  padding:0; background:#fff;
+  border-bottom:1px solid rgba(100,130,180,0.13);
+  vertical-align:top;
+}
+.dt-stat-card {
+  padding:6px 10px 5px;
+  border-right:1px solid rgba(100,130,180,0.09);
+  box-sizing:border-box;
+}
+.dt-stat-label {
+  font-size:9px; font-weight:700; letter-spacing:0.6px;
+  text-transform:uppercase; color:#7A8BA8; margin-bottom:2px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.dt-spark-wrap {
+  position:relative; width:100%; height:36px; margin-bottom:2px;
+}
+.dt-stat-vals {
+  font-size:9.5px; color:#1A2535; display:flex; justify-content:space-between;
+  align-items:center;
+}
+.dt-stat-minmax {
+  display:flex; justify-content:space-between;
+  font-size:8.5px; color:#7A8BA8; margin-top:1px;
+}
 
-.dt-th { background:#EBF4FF;border-bottom:2px solid rgba(100,130,180,0.18);border-right:1px solid rgba(100,130,180,0.09);font-size:11.5px;font-weight:600;color:#1A4F9C;white-space:nowrap;vertical-align:middle;box-sizing:border-box;padding:0 }
-.dt-thi { display:flex;align-items:center;gap:4px;padding:6px 10px }
-.dt-thn { flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default }
+/* Column header row */
+.dt-th {
+  padding:0;
+  background:#EBF4FF;
+  border-bottom:2px solid rgba(100,130,180,0.18);
+  border-right:1px solid rgba(100,130,180,0.10);
+  font-size:11.5px; font-weight:600; color:#1A4F9C;
+  white-space:nowrap; position:relative; user-select:none; vertical-align:middle;
+  box-sizing:border-box;
+}
+.dt-th-inner {
+  display:flex; align-items:center; gap:4px; padding:6px 10px 5px;
+  cursor:pointer;
+}
+.dt-th-inner:hover { background:rgba(91,163,245,0.07); }
 
-.dt-sort-btn { display:flex;align-items:center;justify-content:center;width:20px;height:20px;border:none;background:transparent;cursor:pointer;border-radius:4px;flex-shrink:0;padding:0;transition:background .1s }
-.dt-sort-btn:hover { background:rgba(91,163,245,0.12) }
+/* Sort icon */
+.dt-sort-icon { flex-shrink:0; display:flex; align-items:center; opacity:0.3; }
+.dt-sort-icon.active-asc,
+.dt-sort-icon.active-desc { opacity:1; color:#2979D9; }
 
-.dt-filt-btn { display:flex;align-items:center;justify-content:center;width:22px;height:22px;border:none;background:transparent;cursor:pointer;border-radius:5px;flex-shrink:0;padding:2px;transition:background .1s }
-.dt-filt-btn:hover { background:rgba(91,163,245,0.10) }
-.dt-filt-btn.on { background:#EBF4FF }
+/* Filter button — slider icon */
+.dt-filter-btn {
+  display:flex; align-items:center; justify-content:center;
+  width:20px; height:20px; border-radius:5px; border:none;
+  background:transparent; cursor:pointer; color:#9AAFC4;
+  transition:background 0.1s, color 0.1s; flex-shrink:0; margin-left:auto;
+  padding:0;
+}
+.dt-filter-btn:hover { background:rgba(91,163,245,0.1); color:#2979D9; }
+.dt-filter-btn.active { background:#EBF4FF; color:#2979D9; }
 
-.dt-tb { font-size:8.5px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;padding:1px 4px;border-radius:3px;flex-shrink:0 }
-.dt-tb.numeric { background:#E6F7F4;color:#1A8C78 }
-.dt-tb.string  { background:#F0EEFE;color:#7066D4 }
+.dt-type-badge {
+  font-size:8.5px; font-weight:700; letter-spacing:0.4px; text-transform:uppercase;
+  padding:1px 4px; border-radius:3px; flex-shrink:0;
+}
+.dt-type-badge.numeric { background:#E6F7F4; color:#1A8C78; }
+.dt-type-badge.string  { background:#F0EEFE; color:#7066D4; }
 
-/* Stats strip cards */
-.dt-sc { padding:5px 10px 2px;border-right:1px solid rgba(100,130,180,0.09);flex-shrink:0;box-sizing:border-box }
-.dt-smr { display:flex;align-items:center;gap:6px;margin-bottom:2px;overflow:hidden }
-.dt-mv { font-size:10px;font-weight:600;white-space:nowrap }
-.dt-mv.teal   { color:#1A8C78 }
-.dt-mv.blue   { color:#2979D9 }
-.dt-mv.purple { color:#7066D4 }
-.dt-mv.muted  { color:#7A8BA8;font-weight:400 }
+/* Filter panel */
+.sdt-fp-section { padding:8px 12px; border-bottom:1px solid rgba(100,130,180,0.10); }
+.sdt-fp-label { font-size:9.5px; font-weight:600; letter-spacing:0.5px; text-transform:uppercase; color:#7A8BA8; margin-bottom:5px; }
+.sdt-fp-input {
+  width:100%; padding:5px 9px; font-size:12px; font-family:'DM Sans',sans-serif;
+  border:1.5px solid rgba(100,130,180,0.22); border-radius:7px;
+  background:#F7F9FC; color:#1A2535; outline:none; box-sizing:border-box;
+}
+.sdt-fp-input:focus { border-color:#5BA3F5; background:#fff; }
 
-/* Sparkline wrapper — fixed height, relative for tooltip */
-.dt-sw { position:relative;height:34px;width:100% }
-.dt-sw canvas { display:block;width:100% !important;height:100% !important }
+.sdt-chip {
+  display:inline-flex; align-items:center; gap:4px;
+  padding:2px 7px 2px 9px; border-radius:20px; font-size:10.5px; font-weight:500;
+  background:#EBF4FF; color:#1A4F9C; border:1px solid #C8E2FF;
+}
+.sdt-chip-x {
+  display:flex; align-items:center; justify-content:center;
+  width:13px; height:13px; border-radius:50%; border:none;
+  background:rgba(41,121,217,0.15); color:#2979D9; cursor:pointer;
+  font-size:9px; line-height:1;
+}
+.sdt-chip-x:hover { background:rgba(41,121,217,0.3); }
 
-/* min/max labels */
-.dt-sl { display:flex;justify-content:space-between;font-size:8px;color:#7A8BA8;margin-top:1px;padding:0 1px }
+.sdt-option {
+  display:flex; align-items:center; gap:7px; padding:4px 9px;
+  cursor:pointer; border-radius:5px; font-size:12px; color:#1A2535;
+}
+.sdt-option:hover { background:#F0F4FF; }
+.sdt-option input[type=checkbox] { accent-color:#2979D9; width:12px; height:12px; flex-shrink:0; }
 
-/* hover tooltip */
-.dt-spk-tt { display:none;position:absolute;top:0;z-index:100;background:#1A2535;color:#fff;border-radius:7px;padding:5px 8px;pointer-events:none;white-space:nowrap;box-shadow:0 4px 14px rgba(15,25,50,0.22);min-width:115px }
+#sdt-table-container::-webkit-scrollbar { height:5px; width:5px; }
+#sdt-table-container::-webkit-scrollbar-thumb { background:rgba(100,130,180,0.22); border-radius:4px; }
 
-.dt-stop3 { font-size:10px;color:#7A8BA8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px;line-height:1.3 }
+/* Mean/median tooltip */
+.sdt-marker-tip {
+  position:absolute; bottom:calc(100% + 4px); left:50%; transform:translateX(-50%);
+  background:#1A2535; color:#fff; font-size:9.5px; padding:3px 7px;
+  border-radius:5px; white-space:nowrap; pointer-events:none;
+  opacity:0; transition:opacity 0.15s; z-index:10;
+}
+.sdt-marker:hover .sdt-marker-tip { opacity:1; }
+</style>
+`;
+  }
 
-#sdt-table-container::-webkit-scrollbar { width:6px;height:6px }
-#sdt-table-container::-webkit-scrollbar-thumb { background:rgba(100,130,180,0.22);border-radius:4px }
-#sdt-stats-strip::-webkit-scrollbar { display:none }
-</style>`; }
+  /* ═══════════════════════════════════════════════════════════════════
+     RENDER THEAD  (stats row + header row, both sticky)
+  ═══════════════════════════════════════════════════════════════════ */
+  function renderHeader() {
+    const thead = document.getElementById('sdt-thead');
+    if (!thead) return;
 
-  /* ── PUBLIC API ── */
-  const SarthiDatatable = {
-    open(csvUrl, title) {
-      Object.assign(_st, { csvUrl, title: title||'Data Table', filters:{}, sortCol:null, sortDir:'none', globalSearch:'', panelOpen:null });
-      if (!document.getElementById('sdt-overlay')) {
-        const d = document.createElement('div'); d.innerHTML = buildModalHTML(); document.body.appendChild(d);
+    const cols   = _state.columns;
+    const widths = _state.colWidths;
+
+    // ── Row 1: Stats strip ──────────────────────────────────────────
+    let statsRow = '<tr class="dt-stats-row">';
+    cols.forEach((col, ci) => {
+      const w = widths[ci] || COL_MIN_W;
+      statsRow += `<td style="min-width:${w}px;max-width:${w}px;width:${w}px;">`;
+      statsRow += buildStatCard(col, ci, w);
+      statsRow += '</td>';
+    });
+    statsRow += '</tr>';
+
+    // ── Row 2: Column headers ────────────────────────────────────────
+    let headRow = '<tr>';
+    cols.forEach((col, ci) => {
+      const w         = widths[ci] || COL_MIN_W;
+      const isSort    = _state.sortCol === col.name;
+      const hasFilter = hasActiveFilter(col.name);
+      const typeLabel = col.type === 'numeric' ? 'num' : 'str';
+      const typeCls   = col.type === 'numeric' ? 'numeric' : 'string';
+
+      // Sort icon: always visible, shows state
+      let sortIconSvg;
+      if (!isSort) {
+        // unsorted — both arrows faint
+        sortIconSvg = `<svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" style="opacity:0.25">
+          <path d="M5 1L2 5h6L5 1zm0 12l3-4H2l3 4z"/>
+        </svg>`;
+      } else if (_state.sortDir === 'asc') {
+        // asc — up arrow solid, down faint
+        sortIconSvg = `<svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor">
+          <path d="M5 1L2 5h6L5 1z" style="opacity:1;fill:#2979D9"/>
+          <path d="M5 13l3-4H2l3 4z" style="opacity:0.2"/>
+        </svg>`;
+      } else {
+        // desc — down arrow solid, up faint
+        sortIconSvg = `<svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor">
+          <path d="M5 1L2 5h6L5 1z" style="opacity:0.2"/>
+          <path d="M5 13l3-4H2l3 4z" style="opacity:1;fill:#2979D9"/>
+        </svg>`;
       }
-      document.getElementById('sdt-overlay').style.display = 'flex';
+
+      // Filter icon — horizontal sliders (equalizer style)
+      const filterBtnCls = hasFilter ? 'dt-filter-btn active' : 'dt-filter-btn';
+      const filterIconSvg = `<svg width="13" height="13" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+        <line x1="3" y1="5" x2="17" y2="5"/>
+        <circle cx="12" cy="5" r="2.2" fill="currentColor" stroke="none" style="opacity:0.9"/>
+        <line x1="3" y1="10" x2="17" y2="10"/>
+        <circle cx="7" cy="10" r="2.2" fill="currentColor" stroke="none" style="opacity:0.9"/>
+        <line x1="3" y1="15" x2="17" y2="15"/>
+        <circle cx="13" cy="15" r="2.2" fill="currentColor" stroke="none" style="opacity:0.9"/>
+      </svg>`;
+
+      headRow += `<th class="dt-th" style="min-width:${w}px;max-width:${w}px;width:${w}px;" data-col="${esc(col.name)}">
+        <div class="dt-th-inner" onclick="SarthiDatatable._sortBy('${esc(col.name)}')">
+          <span class="dt-type-badge ${typeCls}">${typeLabel}</span>
+          <span style="overflow:hidden;text-overflow:ellipsis;flex:1;max-width:${w - 80}px;" title="${esc(col.name)}">${esc(col.name)}</span>
+          <span class="dt-sort-icon ${isSort ? (_state.sortDir === 'asc' ? 'active-asc' : 'active-desc') : ''}">${sortIconSvg}</span>
+          <button class="${filterBtnCls}" title="Filter ${esc(col.name)}"
+            onclick="event.stopPropagation();SarthiDatatable._openFilterPanel('${esc(col.name)}', this)"
+          >${filterIconSvg}</button>
+        </div>
+      </th>`;
+    });
+    headRow += '</tr>';
+
+    thead.innerHTML = statsRow + headRow;
+
+    // Draw sparklines after DOM update
+    requestAnimationFrame(() => drawAllSparklines());
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     STAT CARD HTML
+  ═══════════════════════════════════════════════════════════════════ */
+  function buildStatCard(col, ci, w) {
+    if (col.type === 'numeric') {
+      // Use filtered stats if filters are active
+      const s = _state.filteredData.length < _state.rawData.length
+        ? (computeFilteredStats(col.name, _state.filteredData) || col.stats)
+        : col.stats;
+
+      return `<div class="dt-stat-card" style="width:${w}px;box-sizing:border-box;">
+        <div class="dt-stat-label">${esc(col.name)}</div>
+        <div class="dt-spark-wrap" id="sdt-sparkwrap-${ci}">
+          <canvas id="sdt-spark-${ci}" style="width:100%;height:36px;display:block;"></canvas>
+          <!-- mean marker -->
+          <div class="sdt-marker" id="sdt-mean-${ci}" style="
+            position:absolute; top:0; bottom:0; width:0;
+            border-left:1.5px dashed #5BA3F5; cursor:default;
+          ">
+            <div class="sdt-marker-tip">Mean: ${fmt(s.mean)}</div>
+          </div>
+          <!-- median marker -->
+          <div class="sdt-marker" id="sdt-med-${ci}" style="
+            position:absolute; top:0; bottom:0; width:0;
+            border-left:1.5px dashed #7066D4; cursor:default;
+          ">
+            <div class="sdt-marker-tip">Median: ${fmt(s.median)}</div>
+          </div>
+        </div>
+        <div class="dt-stat-minmax">
+          <span style="color:#2BBFA5;">↓${fmt(s.min)}</span>
+          <span style="color:#5BA3F5;">↑${fmt(s.max)}</span>
+        </div>
+        ${s.nullCount ? `<div style="font-size:8px;color:#C4CFDF;margin-top:1px;">${s.nullCount} null</div>` : ''}
+      </div>`;
+    } else {
+      // String column — unique count + top values
+      const s      = col.stats;
+      const topTxt = (col.uniqueVals || []).slice(0, 2).map(u => esc(u.val)).join(', ');
+      return `<div class="dt-stat-card" style="width:${w}px;box-sizing:border-box;">
+        <div class="dt-stat-label">${esc(col.name)}</div>
+        <div style="font-size:11px;font-weight:600;color:#1A2535;margin:4px 0 2px;">${s.uniqueCount} <span style="font-weight:400;color:#7A8BA8;font-size:9.5px;">unique</span></div>
+        <div style="font-size:9px;color:#7A8BA8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${topTxt}">${topTxt || '—'}</div>
+        ${s.nullCount ? `<div style="font-size:8px;color:#C4CFDF;margin-top:2px;">${s.nullCount} null</div>` : ''}
+      </div>`;
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     SPARKLINE DRAWING (Chart.js)
+  ═══════════════════════════════════════════════════════════════════ */
+  function drawAllSparklines() {
+    // Destroy old
+    Object.values(_state.sparkCharts).forEach(c => { try { c.destroy(); } catch {} });
+    _state.sparkCharts = {};
+
+    if (!global.Chart) return;
+
+    _state.columns.forEach((col, ci) => {
+      if (col.type !== 'numeric') return;
+
+      const canvas = document.getElementById(`sdt-spark-${ci}`);
+      const wrap   = document.getElementById(`sdt-sparkwrap-${ci}`);
+      const meanEl = document.getElementById(`sdt-mean-${ci}`);
+      const medEl  = document.getElementById(`sdt-med-${ci}`);
+      if (!canvas || !wrap) return;
+
+      // Use filtered data stats when filters are active
+      const s = _state.filteredData.length < _state.rawData.length
+        ? (computeFilteredStats(col.name, _state.filteredData) || col.stats)
+        : col.stats;
+      const hist = s.hist;
+      if (!hist || !hist.counts || !hist.counts.length) return;
+
+      const colName = col.name;
+
+      try {
+        _state.sparkCharts[ci] = new global.Chart(canvas, {
+          type: 'bar',
+          data: {
+            labels: hist.labels,
+            datasets: [{
+              data: hist.counts,
+              backgroundColor: 'rgba(91,163,245,0.45)',
+              borderColor:     'rgba(41,121,217,0.55)',
+              borderWidth: 1,
+              borderRadius: 2,
+              hoverBackgroundColor: 'rgba(41,121,217,0.7)',
+            }]
+          },
+          options: {
+            responsive:          false,
+            animation:           false,
+            plugins: {
+              legend:  { display: false },
+              tooltip: {
+                enabled: true,
+                callbacks: {
+                  title: (items) => {
+                    const idx = items[0].dataIndex;
+                    const lo  = hist.labels[idx];
+                    const hi  = +(lo + (hist.step || 0)).toFixed(2);
+                    return `${fmt(lo)} – ${fmt(hi)}`;
+                  },
+                  label: (item) => `Count: ${item.raw}`,
+                },
+                backgroundColor: '#1A2535',
+                titleColor:      '#fff',
+                bodyColor:       '#C8E2FF',
+                padding:         6,
+                cornerRadius:    6,
+                displayColors:   false,
+              }
+            },
+            scales: {
+              x: { display: false },
+              y: { display: false, beginAtZero: true }
+            },
+            layout:              { padding: 0 },
+            onClick: (evt, elements) => {
+              if (!elements.length) return;
+              const idx = elements[0].index;
+              const lo  = hist.labels[idx];
+              const hi  = +(lo + (hist.step || 1)).toFixed(4);
+              // Set range filter for this bar
+              if (!_state.filters[colName]) _state.filters[colName] = {};
+              _state.filters[colName].min = lo;
+              _state.filters[colName].max = hi;
+              refresh();
+            },
+          }
+        });
+
+        // Position mean & median dashed lines
+        positionMarker(meanEl, medEl, s, hist, wrap);
+
+      } catch (e) { /* silent */ }
+    });
+  }
+
+  function positionMarker(meanEl, medEl, s, hist, wrap) {
+    if (!meanEl || !medEl || !wrap) return;
+    const wrapW = wrap.offsetWidth || 120;
+    const range = hist.max - hist.min;
+    if (range <= 0) return;
+
+    const meanPct   = (s.mean   - hist.min) / range;
+    const medianPct = (s.median - hist.min) / range;
+
+    meanEl.style.left   = Math.min(Math.max(meanPct   * wrapW, 1), wrapW - 2) + 'px';
+    medEl.style.left    = Math.min(Math.max(medianPct * wrapW, 1), wrapW - 2) + 'px';
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     FILTER PANEL
+  ═══════════════════════════════════════════════════════════════════ */
+  function openFilterPanel(colName, btnEl) {
+    const col   = _state.columns.find(c => c.name === colName);
+    const panel = document.getElementById('sdt-filter-panel');
+    if (!col || !panel) return;
+
+    if (_state.panelOpen === colName) { closeFilterPanel(); return; }
+    _state.panelOpen = colName;
+
+    const rect = btnEl.getBoundingClientRect();
+    panel.style.left    = Math.min(rect.left, window.innerWidth - 260) + 'px';
+    panel.style.top     = (rect.bottom + 4) + 'px';
+    panel.style.display = 'block';
+
+    if (col.type === 'string') renderStringFilterPanel(col, panel);
+    else renderNumericFilterPanel(col, panel);
+
+    setTimeout(() => {
+      document.addEventListener('click', _outsideFilterClose, { once: true });
+    }, 10);
+  }
+
+  function _outsideFilterClose(e) {
+    const panel = document.getElementById('sdt-filter-panel');
+    if (panel && !panel.contains(e.target)) closeFilterPanel();
+  }
+
+  function closeFilterPanel() {
+    const panel = document.getElementById('sdt-filter-panel');
+    if (panel) panel.style.display = 'none';
+    _state.panelOpen = null;
+  }
+
+  function renderStringFilterPanel(col, panel) {
+    const f        = _state.filters[col.name] || {};
+    const selected = f.selected || [];
+    const srchTxt  = f.text || '';
+    const topVals  = col.uniqueVals.slice(0, 200);
+    const filtered = srchTxt
+      ? topVals.filter(u => u.val.toLowerCase().includes(srchTxt.toLowerCase()))
+      : topVals;
+
+    panel.innerHTML = `
+      <div style="padding:8px 12px 6px;border-bottom:1px solid rgba(100,130,180,0.10);display:flex;align-items:center;justify-content:space-between;">
+        <span style="font-size:11px;font-weight:600;color:#1A2535;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;">${esc(col.name)}</span>
+        <span style="font-size:10px;color:#7A8BA8;">${col.stats.uniqueCount} unique</span>
+      </div>
+      <div class="sdt-fp-section">
+        <input class="sdt-fp-input" id="sdt-str-search" placeholder="Search values…"
+          value="${esc(srchTxt)}"
+          oninput="SarthiDatatable._strSearchChange('${esc(col.name)}', this.value)"
+        />
+      </div>
+      <div style="max-height:190px;overflow-y:auto;padding:4px 6px;">
+        ${selected.length > 0 ? `
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:0 4px 4px;">
+            <span style="font-size:10px;color:#7A8BA8;">${selected.length} selected</span>
+            <button onclick="SarthiDatatable._clearColFilter('${esc(col.name)}')"
+              style="font-size:10px;color:#5BA3F5;background:none;border:none;cursor:pointer;font-family:'DM Sans',sans-serif;">Clear</button>
+          </div>` : ''}
+        ${filtered.map(u => `
+          <div class="sdt-option">
+            <input type="checkbox" ${selected.includes(u.val) ? 'checked' : ''}
+              onchange="SarthiDatatable._toggleValFilter('${esc(col.name)}', '${esc(u.val)}')" />
+            <span style="flex:1;overflow:hidden;text-overflow:ellipsis;" title="${esc(u.val)}">${esc(u.val)}</span>
+            <span style="font-size:9.5px;color:#7A8BA8;flex-shrink:0;">${u.count}</span>
+          </div>`).join('')}
+        ${filtered.length === 0 ? '<div style="font-size:11.5px;color:#7A8BA8;text-align:center;padding:10px 0;">No values found</div>' : ''}
+      </div>`;
+  }
+
+  function renderNumericFilterPanel(col, panel) {
+    const f  = _state.filters[col.name] || {};
+    const s  = col.stats;
+    panel.innerHTML = `
+      <div style="padding:8px 12px 6px;border-bottom:1px solid rgba(100,130,180,0.10);display:flex;align-items:center;justify-content:space-between;">
+        <span style="font-size:11px;font-weight:600;color:#1A2535;">${esc(col.name)}</span>
+        <span style="font-size:10px;color:#7A8BA8;">numeric</span>
+      </div>
+      <div class="sdt-fp-section">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:6px;">
+          <div>
+            <div class="sdt-fp-label">Min</div>
+            <input class="sdt-fp-input" type="number" id="sdt-num-min"
+              placeholder="${fmt(s.min)}" value="${f.min !== undefined ? f.min : ''}"
+              oninput="SarthiDatatable._numFilterChange('${esc(col.name)}')" />
+          </div>
+          <div>
+            <div class="sdt-fp-label">Max</div>
+            <input class="sdt-fp-input" type="number" id="sdt-num-max"
+              placeholder="${fmt(s.max)}" value="${f.max !== undefined ? f.max : ''}"
+              oninput="SarthiDatatable._numFilterChange('${esc(col.name)}')" />
+          </div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:9.5px;color:#7A8BA8;">
+          <span>Range: ${fmt(s.min)} – ${fmt(s.max)}</span>
+          <span>μ${fmt(s.mean)}</span>
+        </div>
+      </div>
+      <div style="padding:6px 12px;">
+        <button onclick="SarthiDatatable._clearColFilter('${esc(col.name)}')"
+          style="width:100%;padding:5px;font-size:11px;font-family:'DM Sans',sans-serif;font-weight:500;
+          border:1px solid rgba(100,130,180,0.22);border-radius:7px;background:transparent;color:#7A8BA8;cursor:pointer;"
+          onmouseover="this.style.background='#F0F4FF';this.style.color='#1A2535'"
+          onmouseout="this.style.background='transparent';this.style.color='#7A8BA8'"
+        >Clear filter</button>
+      </div>`;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     FILTER CHIPS
+  ═══════════════════════════════════════════════════════════════════ */
+  function renderChips() {
+    const chips    = document.getElementById('sdt-chips');
+    const hasAny   = Object.keys(_state.filters).some(k => hasActiveFilter(k));
+    const hasGlob  = !!_state.globalSearch;
+    if (!chips) return;
+    if (!hasAny && !hasGlob) { chips.style.display = 'none'; chips.innerHTML = ''; return; }
+    chips.style.display = 'flex';
+
+    let html = '';
+    if (hasGlob) {
+      html += `<span class="sdt-chip">Search: "${esc(_state.globalSearch)}"
+        <button class="sdt-chip-x" onclick="SarthiDatatable._clearGlobal()">×</button></span>`;
+    }
+    Object.entries(_state.filters).forEach(([col, f]) => {
+      const cm = _state.columns.find(c => c.name === col);
+      if (!cm) return;
+      if (cm.type === 'string') {
+        if (f.selected && f.selected.length) {
+          const lbl = f.selected.length === 1 ? esc(f.selected[0]) : `${f.selected.length} values`;
+          html += `<span class="sdt-chip">${esc(col)}: ${lbl}
+            <button class="sdt-chip-x" onclick="SarthiDatatable._clearColFilter('${esc(col)}')">×</button></span>`;
+        }
+        if (f.text) {
+          html += `<span class="sdt-chip">${esc(col)} contains "${esc(f.text)}"
+            <button class="sdt-chip-x" onclick="SarthiDatatable._clearColFilter('${esc(col)}')">×</button></span>`;
+        }
+      } else {
+        if (f.min !== '' && f.min !== undefined)
+          html += `<span class="sdt-chip">${esc(col)} ≥ ${fmt(f.min)}
+            <button class="sdt-chip-x" onclick="SarthiDatatable._clearColFilter('${esc(col)}')">×</button></span>`;
+        if (f.max !== '' && f.max !== undefined)
+          html += `<span class="sdt-chip">${esc(col)} ≤ ${fmt(f.max)}
+            <button class="sdt-chip-x" onclick="SarthiDatatable._clearColFilter('${esc(col)}')">×</button></span>`;
+      }
+    });
+    chips.innerHTML = html;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     STATUS
+  ═══════════════════════════════════════════════════════════════════ */
+  function updateStatus() {
+    const left  = document.getElementById('sdt-status-left');
+    const count = document.getElementById('sdt-row-count');
+    const total = _state.rawData.length;
+    const shown = _state.filteredData.length;
+    const txt   = shown < total
+      ? `${shown.toLocaleString()} of ${total.toLocaleString()} rows · ${_state.columns.length} columns`
+      : `${total.toLocaleString()} rows · ${_state.columns.length} columns`;
+    if (left)  left.textContent  = txt;
+    if (count) count.textContent = txt;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     REFRESH
+  ═══════════════════════════════════════════════════════════════════ */
+  function refresh() {
+    applyFilters();
+    renderHeader();          // redraws stats strip + column headers + sparklines
+    const tbody = document.getElementById('sdt-tbody');
+    const cont  = document.getElementById('sdt-table-container');
+    if (tbody && cont) renderVirtualRows(tbody, cont);
+    renderChips();
+    updateStatus();
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     LOADING
+  ═══════════════════════════════════════════════════════════════════ */
+  function showLoading(msg) {
+    const tbody = document.getElementById('sdt-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = `<tr><td colspan="100" style="
+      text-align:center; padding:50px 20px; color:#7A8BA8; font-size:13px;
+    ">
+      <div style="display:flex;align-items:center;justify-content:center;gap:6px;">
+        <div style="width:5px;height:5px;border-radius:50%;background:#5BA3F5;animation:sdtP 1.2s ease-in-out infinite"></div>
+        <div style="width:5px;height:5px;border-radius:50%;background:#5BA3F5;animation:sdtP 1.2s ease-in-out 0.2s infinite"></div>
+        <div style="width:5px;height:5px;border-radius:50%;background:#5BA3F5;animation:sdtP 1.2s ease-in-out 0.4s infinite"></div>
+      </div>
+      <div style="margin-top:10px;">${esc(msg)}</div>
+      <style>@keyframes sdtP{0%,80%,100%{transform:scale(0.8);opacity:0.4}40%{transform:scale(1.2);opacity:1}}</style>
+    </td></tr>`;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     CHART.JS LOADER
+  ═══════════════════════════════════════════════════════════════════ */
+  function ensureChartJS(cb) {
+    if (global.Chart) { cb(); return; }
+    const s = document.createElement('script');
+    s.src = CHARTJS_CDN;
+    s.onload  = cb;
+    s.onerror = cb;
+    document.head.appendChild(s);
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════
+     PUBLIC API
+  ═══════════════════════════════════════════════════════════════════ */
+  const SarthiDatatable = {
+
+    open(csvUrl, title) {
+      _state.csvUrl       = csvUrl;
+      _state.title        = title || 'Data Table';
+      _state.filters      = {};
+      _state.sortCol      = null;
+      _state.sortDir      = 'asc';
+      _state.globalSearch = '';
+      _state.panelOpen    = null;
+      _state.sparkCharts  = {};
+
+      if (!document.getElementById('sdt-overlay')) {
+        const div = document.createElement('div');
+        div.innerHTML = buildModalHTML();
+        document.body.appendChild(div);
+      }
+
+      const overlay = document.getElementById('sdt-overlay');
+      overlay.style.display = 'flex';
       document.body.style.overflow = 'hidden';
-      const te = document.getElementById('sdt-title'); if (te) te.textContent = title || 'Data Table';
-      showLoading('Loading CSV…');
+
+      const titleEl = document.getElementById('sdt-title');
+      if (titleEl) titleEl.textContent = title || 'Data Table';
+
+      showLoading('Loading data…');
+
       ensureChartJS(() => {
         fetch(csvUrl)
           .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); })
           .then(text => {
             const { headers, rows } = parseCSV(text);
-            _st.rawData = rows; _st.columns = detectColumns(headers, rows); _st.filteredData = rows; _st.filters = {};
-            buildFull();
-            const gs = document.getElementById('sdt-gs');
-            if (gs) { gs.value = ''; gs.oninput = e => { _st.globalSearch = e.target.value; refresh(); }; }
+            _state.rawData      = rows;
+            _state.columns      = detectColumns(headers, rows);
+            _state.filteredData = rows;
+            _state.filters      = {};
+            _state.colWidths    = computeColWidths(_state.columns, rows);
+
+            refresh();
+
+            // Wire global search
+            const gs = document.getElementById('sdt-global-search');
+            if (gs) {
+              gs.value = '';
+              gs.oninput = (e) => { _state.globalSearch = e.target.value; refresh(); };
+            }
+
+            // Wire virtual scroll
+            const cont = document.getElementById('sdt-table-container');
+            if (cont) {
+              cont.onscroll = () => {
+                _state.scrollTop = cont.scrollTop;
+                const tbody = document.getElementById('sdt-tbody');
+                if (tbody) renderVirtualRows(tbody, cont);
+              };
+            }
           })
-          .catch(err => showLoading(`Failed: ${err.message}`));
+          .catch(err => { showLoading(`Failed to load data: ${err.message}`); });
       });
     },
 
     close() {
-      const o = document.getElementById('sdt-overlay'); if (o) o.style.display = 'none';
+      const overlay = document.getElementById('sdt-overlay');
+      if (overlay) overlay.style.display = 'none';
       document.body.style.overflow = '';
-      closeFP();
-      Object.values(_st.sparkCharts).forEach(c => { try { c.destroy(); } catch {} });
-      _st.sparkCharts = {};
+      closeFilterPanel();
+      Object.values(_state.sparkCharts).forEach(c => { try { c.destroy(); } catch {} });
+      _state.sparkCharts = {};
     },
 
-    _sortBy(cn) {
-      if (_st.sortCol === cn) {
-        _st.sortDir = _st.sortDir === 'none' ? 'asc' : _st.sortDir === 'asc' ? 'desc' : 'none';
-        if (_st.sortDir === 'none') _st.sortCol = null;
-      } else { _st.sortCol = cn; _st.sortDir = 'asc'; }
+    _sortBy(colName) {
+      if (_state.sortCol === colName) {
+        _state.sortDir = _state.sortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        _state.sortCol = colName;
+        _state.sortDir = 'asc';
+      }
       refresh();
-      const c = document.getElementById('sdt-table-container'); if (c) c.scrollTop = 0;
+      const cont = document.getElementById('sdt-table-container');
+      if (cont) cont.scrollTop = 0;
     },
 
-    _openFP(cn, btn)      { openFP(cn, btn); },
-    _tVF(cn, val)         {
-      if (!_st.filters[cn]) _st.filters[cn] = { selected:[], text:'' };
-      const s = _st.filters[cn].selected, i = s.indexOf(val);
-      i === -1 ? s.push(val) : s.splice(i,1);
-      if (!s.length && !_st.filters[cn].text) delete _st.filters[cn];
+    _openFilterPanel(colName, btnEl) { openFilterPanel(colName, btnEl); },
+
+    _toggleValFilter(colName, val) {
+      if (!_state.filters[colName]) _state.filters[colName] = { selected: [], text: '' };
+      const sel = _state.filters[colName].selected;
+      const idx = sel.indexOf(val);
+      if (idx === -1) sel.push(val); else sel.splice(idx, 1);
+      if (!sel.length && !_state.filters[colName].text) delete _state.filters[colName];
       refresh();
-      const col = _st.columns.find(c=>c.name===cn), p = document.getElementById('sdt-fp');
-      if (col && p && p.style.display!=='none') { renderSFP(col,p); const ss=document.getElementById('sdt-ss'); if(ss) ss.focus(); }
+      const col   = _state.columns.find(c => c.name === colName);
+      const panel = document.getElementById('sdt-filter-panel');
+      if (col && panel && panel.style.display !== 'none') {
+        renderStringFilterPanel(col, panel);
+        const si = document.getElementById('sdt-str-search');
+        if (si) si.focus();
+      }
     },
-    _sSC(cn, val)         {
-      if (!_st.filters[cn]) _st.filters[cn] = { selected:[], text:'' };
-      _st.filters[cn].text = val;
-      if (!val && !(_st.filters[cn].selected||[]).length) delete _st.filters[cn];
+
+    _strSearchChange(colName, val) {
+      if (!_state.filters[colName]) _state.filters[colName] = { selected: [], text: '' };
+      _state.filters[colName].text = val;
+      if (!val && !(_state.filters[colName].selected || []).length) delete _state.filters[colName];
       refresh();
-      const col=_st.columns.find(c=>c.name===cn), p=document.getElementById('sdt-fp');
-      if (col && p && p.style.display!=='none') { renderSFP(col,p); const ss=document.getElementById('sdt-ss'); if(ss){ss.focus();ss.value=val;} }
+      const col   = _state.columns.find(c => c.name === colName);
+      const panel = document.getElementById('sdt-filter-panel');
+      if (col && panel && panel.style.display !== 'none') {
+        renderStringFilterPanel(col, panel);
+        const si = document.getElementById('sdt-str-search');
+        if (si) { si.focus(); si.value = val; }
+      }
     },
-    _nFC(cn)              {
-      const mn=document.getElementById('sdt-nm'), mx=document.getElementById('sdt-nx');
-      if (!_st.filters[cn]) _st.filters[cn] = {};
-      _st.filters[cn].min = mn?mn.value:''; _st.filters[cn].max = mx?mx.value:'';
-      if (!_st.filters[cn].min && !_st.filters[cn].max) delete _st.filters[cn];
+
+    _numFilterChange(colName) {
+      const minEl = document.getElementById('sdt-num-min');
+      const maxEl = document.getElementById('sdt-num-max');
+      if (!_state.filters[colName]) _state.filters[colName] = {};
+      _state.filters[colName].min = minEl ? minEl.value : '';
+      _state.filters[colName].max = maxEl ? maxEl.value : '';
+      if (!_state.filters[colName].min && !_state.filters[colName].max)
+        delete _state.filters[colName];
       refresh();
     },
-    _clrC(cn)             { delete _st.filters[cn]; refresh(); closeFP(); },
-    _clrG()               { _st.globalSearch=''; const g=document.getElementById('sdt-gs'); if(g) g.value=''; refresh(); },
-    _resetAll()           {
-      _st.filters={}; _st.globalSearch=''; _st.sortCol=null; _st.sortDir='none';
-      const g=document.getElementById('sdt-gs'); if(g) g.value='';
-      closeFP(); refresh();
-      const c=document.getElementById('sdt-table-container'); if(c) c.scrollTop=0;
+
+    _clearColFilter(colName) {
+      delete _state.filters[colName];
+      refresh();
+      closeFilterPanel();
+    },
+
+    _clearGlobal() {
+      _state.globalSearch = '';
+      const gs = document.getElementById('sdt-global-search');
+      if (gs) gs.value = '';
+      refresh();
+    },
+
+    _resetAll() {
+      _state.filters      = {};
+      _state.globalSearch = '';
+      _state.sortCol      = null;
+      _state.sortDir      = 'asc';
+      const gs = document.getElementById('sdt-global-search');
+      if (gs) gs.value = '';
+      closeFilterPanel();
+      refresh();
+      const cont = document.getElementById('sdt-table-container');
+      if (cont) cont.scrollTop = 0;
     },
   };
 
+  /* ═══════════════════════════════════════════════════════════════════
+     HELPERS
+  ═══════════════════════════════════════════════════════════════════ */
+  function hasActiveFilter(colName) {
+    const f = _state.filters[colName];
+    if (!f) return false;
+    if (f.selected && f.selected.length > 0) return true;
+    if (f.text) return true;
+    if (f.min !== '' && f.min !== undefined) return true;
+    if (f.max !== '' && f.max !== undefined) return true;
+    return false;
+  }
+
+  function fmt(n) {
+    if (n === undefined || n === null || isNaN(n)) return '—';
+    const num = parseFloat(n);
+    if (Math.abs(num) >= 1e6)   return (num / 1e6).toFixed(2)  + 'M';
+    if (Math.abs(num) >= 1e3)   return (num / 1e3).toFixed(1)  + 'K';
+    if (Number.isInteger(num))  return num.toLocaleString();
+    return num.toFixed(2);
+  }
+
+  function esc(str) {
+    if (!str) return '';
+    return String(str)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
   global.SarthiDatatable = SarthiDatatable;
+
 })(window);
