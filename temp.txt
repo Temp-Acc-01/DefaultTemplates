@@ -1,27 +1,104 @@
-_state.colWidths    = computeColWidths(_state.columns, rows);
+tooltip: {
+                enabled: true,
+                position: 'nearest',
+                callbacks: {
+                  title: (items) => {
+                    const idx = items[0].dataIndex;
+                    const lo  = hist.labels[idx];
+                    const hi  = +(lo + (hist.step || 0)).toFixed(2);
+                    return `${fmt(lo)} – ${fmt(hi)}`;
+                  },
+                  label: (item) => `Count: ${item.raw}`,
+                },
+                backgroundColor: 'rgba(255,255,255,0.97)',
+                titleColor:      '#1A2535',
+                bodyColor:       '#4A5E7A',
+                borderColor:     'rgba(100,130,180,0.2)',
+                borderWidth:     1,
+                padding:         6,
+                cornerRadius:    6,
+                displayColors:   false,
+                boxShadow:       '0 2px 8px rgba(0,0,0,0.08)',
+              }
 
-            refresh();
 
-            // Wire global search
-            const gs = document.getElementById('sdt-global-search');
-            if (gs) {
-              gs.value = '';
-              gs.oninput = (e) => { _state.globalSearch = e.target.value; refresh(); };
-            }
 
-            // Wire virtual scroll + ResizeObserver
-            const cont = document.getElementById('sdt-table-container');
-            if (cont) {
-              cont.onscroll = () => {
-                _state.scrollTop = cont.scrollTop;
-                const tbody = document.getElementById('sdt-tbody');
-                if (tbody) renderVirtualRows(tbody, cont);
-              };
+------
 
-              if (_state._resizeObserver) _state._resizeObserver.disconnect();
-              _state._resizeObserver = new ResizeObserver(() => {
-                _state.colWidths = computeColWidths(_state.columns, _state.rawData);
-                refresh();
-              });
-              _state._resizeObserver.observe(cont);
-            }
+<!-- mean marker — solid red line -->
+          <div class="sdt-marker" id="sdt-mean-${ci}" style="
+            position:absolute; top:0; bottom:0; width:0;
+            border-left:2px solid rgba(220,50,50,0.75); cursor:default;
+          ">
+            <div class="sdt-marker-tip">Mean: ${fmt(s.mean)}</div>
+          </div>
+          <!-- median marker — dashed purple -->
+          <div class="sdt-marker" id="sdt-med-${ci}" style="
+            position:absolute; top:0; bottom:0; width:0;
+            border-left:1.5px dashed #7066D4; cursor:default;
+          ">
+            <div class="sdt-marker-tip">Median: ${fmt(s.median)}</div>
+          </div>
+
+
+
+----
+.sdt-marker-tip {
+  position:absolute;
+  bottom:calc(100% + 5px);
+  left:50%;
+  transform:translateX(-50%);
+  background:rgba(255,255,255,0.97);
+  color:#1A2535;
+  font-size:9px;
+  font-weight:500;
+  padding:3px 8px;
+  border-radius:5px;
+  border:1px solid rgba(100,130,180,0.2);
+  box-shadow:0 2px 8px rgba(0,0,0,0.09);
+  white-space:nowrap;
+  pointer-events:none;
+  opacity:0;
+  transition:opacity 0.15s;
+  z-index:100;
+}
+.sdt-marker:hover .sdt-marker-tip { opacity:1; }
+
+----
+
+
+
+.dt-spark-wrap {
+  position:relative; width:100%; height:36px; margin-bottom:2px;
+  overflow:visible;
+}
+
+
+
+-----------
+
+
+
+.dt-stat-card {
+  padding:6px 10px 5px;
+  border-right:1px solid rgba(100,130,180,0.09);
+  box-sizing:border-box;
+  overflow:visible;
+  position:relative;
+  z-index:1;
+}
+
+
+
+-----------
+
+
+.dt-stats-row td {
+  padding:0; background:#fff;
+  border-bottom:1px solid rgba(100,130,180,0.13);
+  vertical-align:top;
+  overflow:visible;
+}
+
+
+
