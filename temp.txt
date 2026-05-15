@@ -1,67 +1,26 @@
-/* FIND this: */
-.logo-sub { font-size: 10px; color: var(--text-muted); letter-spacing: 0.8px; text-transform: uppercase; font-weight: 500; margin-top: 1px; }
-
-/* REPLACE with: */
 .logo-sub { font-size: 10px; color: var(--text-muted); letter-spacing: 0.8px; text-transform: uppercase; font-weight: 500; margin-top: 0; }
 
 
 
-
--------------------
-
-
-<!-- FIND this: -->
-<div class="logo">
-  <div>
-    <div class="logo-text">Sarthi</div>
-    <div class="logo-sub">Data Navigator</div>
-  </div>
-</div>
-
-<!-- REPLACE with: -->
-<div class="logo">
-  <div style="display:flex; align-items:baseline; gap:7px;">
-    <div class="logo-text">Sarthi</div>
-    <div class="logo-sub">Data Navigator</div>
-  </div>
-</div>
+------
 
 
-
-----------
-
-
-.sidebar-back { padding: 10px 16px 6px; }
-.back-btn {
-  background: none; border: none; cursor: pointer;
-  font-size: 11.5px; color: var(--text-muted);
-  font-family: 'DM Sans', sans-serif; font-weight: 500;
-  display: flex; align-items: center; gap: 5px;
-  padding: 3px 0;
-  transition: color 0.12s;
-  letter-spacing: 0.1px;
-}
+.sidebar-header .logo > div { display: flex; align-items: baseline; gap: 7px; }
+.sidebar-back { padding: 8px 20px 0; }
+.back-btn { background: none; border: none; cursor: pointer; font-size: 11.5px; color: var(--text-muted); font-family: 'DM Sans', sans-serif; font-weight: 500; display: flex; align-items: center; gap: 4px; padding: 2px 0; transition: color 0.12s; }
 .back-btn:hover { color: var(--text-primary); }
 .back-btn svg { width: 13px; height: 13px; }
 
 
-----------
 
-<!-- FIND this: -->
-<aside class="sidebar">
-  <div class="sidebar-header">
+-------------
 
-<!-- REPLACE with: -->
+
 <aside class="sidebar">
   <div class="sidebar-back">
     <button class="back-btn" onclick="history.back()">
-      <svg viewBox="0 0 24 24" fill="currentColor">
-        <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
-      </svg>
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
       Back
     </button>
   </div>
   <div class="sidebar-header">
-
-
-
