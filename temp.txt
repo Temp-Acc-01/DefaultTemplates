@@ -1,51 +1,24 @@
-# create_user.py - FINAL WORKING VERSION
-import pymysql
-import os
-from dotenv import load_dotenv
-from token_manager import allocate_tokens, _get_conn
-
-load_dotenv()
-
-USERNAME = "user"
-PASSWORD = "user123"
-TOKENS   = 1_000_000
-
-conn = _get_conn()
-try:
-    with conn.cursor() as cur:
-        # 1. Check if user exists
-        cur.execute("SELECT id FROM nlq_user_details WHERE username = %s", (USERNAME,))
-        user_row = cur.fetchone()
-        
-        if user_row:
-            user_id = user_row['id']
-            print(f"User '{USERNAME}' already exists (ID: {user_id})")
-        else:
-            # Create user
-            cur.execute(
-                "INSERT INTO nlq_user_details (username, password) VALUES (%s, %s)",
-                (USERNAME, PASSWORD)
-            )
-            user_id = cur.lastrowid
-            conn.commit()
-            print(f"User '{USERNAME}' created (ID: {user_id})")
-
-    # 2. Allocate tokens
-    print(f"Allocating {TOKENS:,} tokens to '{USERNAME}'...")
-    wallet = allocate_tokens(user_id, TOKENS, request_id="manual_setup")
+case 'tokens_adjusted': {
+  // Update token state with actual balance from backend
+  if (payload.balance !== undefined) {
+    tokenState.available = payload.balance;
+    tokenState.warn = payload.balance <= 25000 && payload.balance > 0;
+    tokenState.blocked = payload.balance <= 0;
     
-    # 3. Check if it worked - wallet dict is returned directly
-    if wallet and 'available_tokens' in wallet:
-        print(f"✅ SUCCESS! Added {TOKENS:,} tokens to '{USERNAME}'")
-        print(f"   New balance: {wallet['available_tokens']:,}")
-        print(f"   Total allocated: {wallet['total_allocated']:,}")
-    else:
-        print(f"❌ Allocation returned unexpected result: {wallet}")
-
-except Exception as e:
-    import traceback
-    print(f"❌ Failed: {e}")
-    traceback.print_exc()
-    conn.rollback()
-finally:
-    conn.close()
+    // Update UI immediately
+    updateTokenUI();
+    
+    // Show refund message if applicable
+    const refundMsg = payload.refunded > 0 
+      ? `✓ Refunded ${payload.refunded.toLocaleString()} unused tokens` 
+      : `✓ Used ${payload.actual_used.toLocaleString()} tokens`;
+    
+    const notice = document.createElement('div');
+    notice.className = 'retry-notice';
+    notice.style.cssText = 'background:#E8F5E9;color:#2E7D32;border-color:#A5D6A7;';
+    notice.innerHTML = refundMsg;
+    bw.appendChild(notice);
+    scrollToBottom();
+  }
+  break;
+}
