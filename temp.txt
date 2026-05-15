@@ -680,3 +680,353 @@ def register_auth(app):
 </script>
 </body>
 </html>
+
+
+------------------
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INTEGRATION GUIDE
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── STEP 1: Install dependencies ─────────────────────────────────────────
+# pip install pymysql bcrypt
+
+# ── STEP 2: app.py changes ───────────────────────────────────────────────
+
+"""
+# ADD at the top with other imports:
+from auth import register_auth, login_required
+
+# ADD inside create_app(), FIRST line before anything else:
+register_auth(app)
+
+# PROTECT all data routes by adding @login_required decorator.
+# Example — wrap /query/stream:
+
+@app.route("/query/stream", methods=["POST", "GET"])
+@login_required                          # ← ADD THIS LINE
+def query_stream():
+    ...
+
+# Do the same for: /query, /generate, /execute, /tables, /upload,
+#                  /download/<filename>, /chart/<filename>, /health
+
+# ADD new routes for login page and chat page:
+
+@app.route("/")
+def root():
+    # Serve login page at root
+    return send_from_directory(".", "login.html")
+
+@app.route("/chat")
+@login_required
+def chat():
+    # Serve chat UI only when authenticated
+    return send_from_directory(".", "sarthi_index.html")
+
+# REMOVE or rename the old @app.route("/") that served sarthi_index.html
+"""
+
+
+# ── STEP 3: sarthi_index.html — CSS to ADD inside <style> ───────────────
+
+LOGOUT_CSS = """
+  /* ── Logout button ── */
+  .logout-btn-wrap {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .logout-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 11px;
+    font-size: 11.5px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+    letter-spacing: 0.1px;
+  }
+
+  .logout-btn:hover {
+    background: var(--slate-100);
+    border-color: var(--border-md);
+    color: var(--text-secondary);
+  }
+
+  .logout-btn-tooltip {
+    position: absolute;
+    top: calc(100% + 7px);
+    right: 0;
+    background: rgba(26, 37, 53, 0.88);
+    color: #fff;
+    font-size: 10.5px;
+    font-family: 'DM Sans', sans-serif;
+    padding: 4px 9px;
+    border-radius: 6px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(-3px);
+    transition: opacity 0.15s, transform 0.15s;
+    z-index: 100;
+  }
+
+  .logout-btn-wrap:hover .logout-btn-tooltip {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  /* ── Logout confirmation modal ── */
+  .logout-confirm-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 4000;
+    align-items: center;
+    justify-content: center;
+    background: rgba(15, 25, 50, 0.3);
+    backdrop-filter: blur(2px);
+    animation: fadeUp 0.15s ease;
+  }
+
+  .logout-confirm-overlay.open {
+    display: flex;
+  }
+
+  .logout-confirm-card {
+    background: var(--surface);
+    border: 1px solid var(--border-md);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 8px 32px rgba(15, 25, 50, 0.12);
+    padding: 22px 24px 18px;
+    width: 320px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    animation: fadeUp 0.18s ease;
+  }
+
+  .logout-confirm-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: var(--slate-100);
+    border: 1px solid var(--border-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .logout-confirm-title {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: -0.1px;
+  }
+
+  .logout-confirm-body {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    line-height: 1.55;
+    margin-top: -6px;
+  }
+
+  .logout-confirm-user {
+    display: inline-block;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .logout-confirm-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 2px;
+  }
+
+  .logout-confirm-cancel {
+    padding: 5px 14px;
+    font-size: 12px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: transparent;
+    border: 1px solid var(--border-md);
+    border-radius: 20px;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .logout-confirm-cancel:hover {
+    background: var(--slate-100);
+    color: var(--text-primary);
+  }
+
+  .logout-confirm-go {
+    padding: 5px 14px;
+    font-size: 12px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    color: var(--blue-800);
+    background: var(--blue-50);
+    border: 1px solid var(--blue-100);
+    border-radius: 20px;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+
+  .logout-confirm-go:hover {
+    background: var(--blue-100);
+    border-color: var(--blue-200);
+  }
+"""
+
+
+# ── STEP 4: sarthi_index.html — HTML to ADD in topbar ───────────────────
+# Inside .topbar div, AFTER the back-btn-wrap div, ADD:
+
+LOGOUT_BUTTON_HTML = """
+    <div class="logout-btn-wrap">
+      <button class="logout-btn" onclick="confirmLogout()">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none"
+             stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+          <polyline points="16 17 21 12 16 7"/>
+          <line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+        Logout
+      </button>
+      <div class="logout-btn-tooltip">Sign out of Sarthi</div>
+    </div>
+"""
+
+
+# ── STEP 5: sarthi_index.html — Modal HTML to ADD before </body> ─────────
+
+LOGOUT_MODAL_HTML = """
+<!-- Logout confirmation modal -->
+<div class="logout-confirm-overlay" id="logout-confirm-overlay">
+  <div class="logout-confirm-card">
+    <div style="display:flex; align-items:center; gap:10px;">
+      <div class="logout-confirm-icon">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none"
+             stroke="var(--text-muted)" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+          <polyline points="16 17 21 12 16 7"/>
+          <line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+      </div>
+      <span class="logout-confirm-title">Sign out?</span>
+    </div>
+    <p class="logout-confirm-body">
+      You're signed in as <span class="logout-confirm-user" id="logout-username-display">—</span>.
+      Your current conversation will not be saved.
+    </p>
+    <div class="logout-confirm-actions">
+      <button class="logout-confirm-cancel" onclick="closeLogoutConfirm()">Stay signed in</button>
+      <button class="logout-confirm-go"     onclick="doLogout()">Sign out</button>
+    </div>
+  </div>
+</div>
+"""
+
+
+# ── STEP 6: sarthi_index.html — JavaScript to ADD inside <script> ────────
+
+LOGOUT_JS = """
+// ─── Auth / logout ───────────────────────────────────────────────────────
+let _currentUsername = '';
+
+// Fetch current user on load and store username for display
+(async () => {
+  try {
+    const r = await fetch(`${API_BASE}/auth/me`);
+    if (!r.ok) {
+      // Not authenticated — redirect to login
+      window.location.href = '/';
+      return;
+    }
+    const d = await r.json();
+    if (d.status === 'success') {
+      _currentUsername = d.username;
+    }
+  } catch {
+    window.location.href = '/';
+  }
+})();
+
+function confirmLogout() {
+  document.getElementById('logout-username-display').textContent =
+    _currentUsername || 'you';
+  document.getElementById('logout-confirm-overlay').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeLogoutConfirm() {
+  document.getElementById('logout-confirm-overlay').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+async function doLogout() {
+  try {
+    await fetch(`${API_BASE}/auth/logout`, { method: 'POST' });
+  } catch { /* ignore */ }
+  closeLogoutConfirm();
+  window.location.href = '/';
+}
+
+// Close logout modal on backdrop click
+document.getElementById('logout-confirm-overlay')?.addEventListener('click', function(e) {
+  if (e.target === this) closeLogoutConfirm();
+});
+
+// Also close on Escape (add to existing keydown handler or add new one)
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    closeLogoutConfirm();
+    closeChartModal(null);   // already exists
+  }
+});
+"""
+
+
+# ── STEP 7: Create user utility script ───────────────────────────────────
+# Run this once to insert a user into the DB:
+
+CREATE_USER_SCRIPT = """
+# create_user.py — run once to add users
+import pymysql
+import bcrypt
+
+conn = pymysql.connect(
+    host='localhost', port=3306,
+    user='nabh', password='nabh@123',
+    database='NABH',
+    cursorclass=pymysql.cursors.DictCursor
+)
+
+def add_user(username, plain_password):
+    hashed = bcrypt.hashpw(plain_password.encode(), bcrypt.gensalt()).decode()
+    with conn.cursor() as cur:
+        cur.execute(
+            \"INSERT INTO nlq_user_details (username, password) VALUES (%s, %s)\",
+            (username, hashed)
+        )
+    conn.commit()
+    print(f\"User '{username}' created.\")
+
+add_user('admin', 'your_password_here')
+add_user('gaurav', 'gaurav_password_here')
+conn.close()
+"""
