@@ -1,179 +1,44 @@
-  <!-- Token Balance Display -->
-  <div class="token-balance-wrap" id="token-balance-wrap" style="display:none;">
-    <div class="token-pill" id="token-pill">
-      <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
-      <span id="token-text">—</span>
-    </div>
-    <div class="token-warning" id="token-warning" style="display:none;">Low quota</div>
-  </div>
+# manage_user_tokens.py
+import pymysql
+import os
+from dotenv import load_dotenv
+from token_manager import allocate_tokens, _get_conn
 
+load_dotenv()
 
+# ── CONFIG ──
+USERNAME = "existing_user"      # Change to target user
+PASSWORD = "SecurePass123!"     # Only used if creating a NEW user
+TOKENS_TO_ADD = 500_000         # Tokens to ADD (top-up amount)
 
---------------------
+conn = _get_conn()
+try:
+    with conn.cursor() as cur:
+        # 1. Check if user already exists
+        cur.execute("SELECT id FROM nlq_user_details WHERE username = %s", (USERNAME,))
+        user_row = cur.fetchone()
 
-  /* ── Token Balance UI ── */
-  .token-balance-wrap { display: flex; align-items: center; gap: 8px; }
-  .token-pill {
-    display: flex; align-items: center; gap: 5px;
-    font-size: 11.5px; font-weight: 500; color: var(--text-secondary);
-    background: var(--slate-50); border: 1px solid var(--border);
-    border-radius: 20px; padding: 3px 10px; transition: all 0.2s;
-  }
-  .token-pill.warn  { background: #FFF3E0; border-color: #FFB74D; color: #E65100; }
-  .token-pill.blocked { background: #FFEBEE; border-color: #EF5350; color: #B71C1C; }
-  .token-warning { font-size: 10px; color: var(--teal-600); font-weight: 500; }
-  .token-warning.hidden { display: none; }
+        if user_row:
+            user_id = user_row['id']
+            print(f"✅ User '{USERNAME}' found (ID: {user_id})")
+        else:
+            # Create new user
+            cur.execute(
+                "INSERT INTO nlq_user_details (username, password) VALUES (%s, %s)",
+                (USERNAME, PASSWORD)
+            )
+            user_id = cur.lastrowid
+            conn.commit()
+            print(f"✅ User '{USERNAME}' created (ID: {user_id})")
 
+        # 2. Allocate tokens (works for both new & existing users)
+        result = allocate_tokens(user_id, TOKENS_TO_ADD, request_id="manual_topup")
+        print(f"✅ Added {TOKENS_TO_ADD:,} tokens to '{USERNAME}'")
+        print(f"   New balance: {result['wallet']['available_tokens']:,}")
+        print(f"   Total allocated: {result['wallet']['total_allocated']:,}")
 
-
-------
-
-let sessions = [];
-let currentSession = null;
-let isLoading = false;
-
-// ── Token State ──
-let tokenState = { available: null, total: null, warn: false, blocked: false };
-
-
-------------
-
-
-
-async function fetchTokenBalance() {
-  try {
-    const r = await fetch(`${API_BASE}/tokens/balance`);
-    if (!r.ok) return;
-    const d = await r.json();
-    if (d.status === 'success') {
-      tokenState.available = d.available_tokens;
-      tokenState.total = d.total_allocated;
-      tokenState.warn = d.warn || false;
-      tokenState.blocked = d.blocked || false;
-      updateTokenUI();
-    }
-  } catch { /* ignore */ }
-}
-
-function updateTokenUI() {
-  const wrap = document.getElementById('token-balance-wrap');
-  const pill = document.getElementById('token-pill');
-  const txt  = document.getElementById('token-text');
-  const warn = document.getElementById('token-warning');
-
-  if (tokenState.available === null) {
-    wrap.style.display = 'none';
-    return;
-  }
-
-  wrap.style.display = 'flex';
-  pill.className = 'token-pill' + (tokenState.warn ? ' warn' : '') + (tokenState.blocked ? ' blocked' : '');
-  
-  if (tokenState.unlimited || tokenState.total === null) {
-    txt.textContent = '∞ tokens';
-    warn.style.display = 'none';
-  } else {
-    txt.textContent = `${tokenState.available.toLocaleString()} / ${tokenState.total.toLocaleString()}`;
-    warn.style.display = tokenState.warn ? 'block' : 'none';
-    warn.textContent = tokenState.warn ? 'Low quota' : (tokenState.blocked ? 'Quota exhausted' : '');
-  }
-}
-
-
-
-----------
-
-// Init
-newChat();
-loadHealth();
-fetchTokenBalance();
-
-
-------
-
-
-          case 'tokens_reserved': {
-            // Update local state temporarily to show reserved amount
-            if (payload.reserved) {
-              const tempBal = Math.max(0, (tokenState.available || 0) - payload.reserved);
-              document.getElementById('token-text').textContent = 
-                `~${tempBal.toLocaleString()} reserved`;
-              document.getElementById('token-pill').classList.add('warn');
-            }
-            break;
-          }
-
-          case 'tokens_adjusted': {
-            // Final balance after query
-            if (payload.balance !== undefined) {
-              tokenState.available = payload.balance;
-              tokenState.warn = payload.balance <= 25000 && payload.balance > 0;
-              tokenState.blocked = payload.balance <= 0;
-              updateTokenUI();
-              
-              // Optional: show brief toast in chat
-              const refundMsg = payload.refunded > 0 ? `Refunded ${payload.refunded.toLocaleString()} unused tokens` : '';
-              if (refundMsg) {
-                const notice = document.createElement('div');
-                notice.className = 'retry-notice';
-                notice.innerHTML = `✓ ${refundMsg}`;
-                bw.appendChild(notice);
-              }
-            }
-            break;
-          }
-
-          case 'tokens_refunded': {
-            // Pipeline failed, full refund
-            if (payload.refunded) {
-              tokenState.available = (tokenState.available || 0) + payload.refunded;
-              updateTokenUI();
-            }
-            break;
-          }
-
-
--------------
-
-
-
-async function sendQuery() {
-  const input = document.getElementById('query-input');
-  const question = input.value.trim();
-  if (!question || isLoading) return;
-
-  // Block if quota exhausted
-  if (tokenState.blocked) {
-    addStaticMessage({
-      role: 'ai', type: 'error',
-      content: 'Token quota exhausted. Please contact admin to recharge.',
-      ts: nowTs()
-    });
-    return;
-  }
-
-
-
-------------
-
-
-  if (tokenState.blocked) {
-    const area = document.getElementById('chat-area');
-    const err = document.createElement('div');
-    err.className = 'error-bubble';
-    err.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg><span>Token quota exhausted. Please contact admin to recharge.</span>`;
-    area.appendChild(err);
-    scrollToBottom();
-    return;
-  }
-
-
-
-
--------------
-
-
-
-
-
-
+except Exception as e:
+    print(f"❌ Failed: {e}")
+    conn.rollback()
+finally:
+    conn.close()
