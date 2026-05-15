@@ -1,301 +1,127 @@
-# ── Token Management Imports ──
-try:
-    from token_manager import (
-        reserve_tokens,
-        refund_tokens,
-        adjust_tokens,
-        estimate_query_tokens,
-        _get_user_id  # Helper to get user_id from username
-    )
-    TOKEN_MANAGER_AVAILABLE = True
-except ImportError:
-    TOKEN_MANAGER_AVAILABLE = False
-    logger.warning("token_manager not found — token tracking disabled")
+# ── Token Management Functions ──
+from token_manager import (
+    _get_user_id,           # Helper to get user_id from username
+    estimate_query_tokens,  # For token estimation
+)
+import uuid  # For generating request_id
 
 
 
-
---------------
-
+-----
 
 
-class NL2SQLPipeline:
-    def __init__(self, token_callback=None):
-        """
-        Initialize pipeline.
-        
-        Args:
-            token_callback: Optional function(tokens_used: int) -> None
-                           Called when token usage is known (for tracking).
-        """
-        self.loader    = DataLoader()
-        self._selector = TableSelectorAgent()
-        self._validator= SQLValidatorAgent(self.loader)
-        self._viz_agent = VizMetaAgent()
-        self._gen_chain = _SQLGeneratorChain()
-        self._plotly    = PlotlyCodeAgent()
-        self._token_callback = token_callback  # ← NEW
-
-
-
-----------------------
-
-
-
-def stream_query(self, question: str, pinned_tables=None, max_retries=None, 
-                 username: str = None, request_id: str = None):
+@app.route("/query/stream", methods=["POST", "GET"])
+@login_required    
+def query_stream():
     """
-    Generator that yields Server-Sent Event strings.
-    
-    NEW ARGS:
-        username: str — for token tracking (required if token manager enabled)
-        request_id: str — unique ID for this request (for transaction logging)
+    Streaming version of /query using Server-Sent Events.
+    NEW: Integrates token reservation/refund pattern.
     """
+    from flask import Response, stream_with_context
     import json
-    import uuid
 
-    token_log = []
-    actual_tokens_used = 0
+    # ── Extract request params ──
+    if request.method == "GET":
+        question    = (request.args.get("question") or "").strip()
+        max_retries = int(request.args.get("max_retries") or MAX_RETRIES)
+        pinned      = PINNED_TABLES
+    else:
+        body        = request.get_json(silent=True) or {}
+        question    = (body.get("question") or "").strip()
+        max_retries = int(body.get("max_retries") or MAX_RETRIES)
+        pinned      = PINNED_TABLES
 
-    if max_retries is None:
-        max_retries = MAX_RETRIES
+    # ── Validate question ──
+    if not question:
+        def _err_gen():
+            yield f"event: pipeline_error\ndata: {json.dumps({'error': 'question is required'})}\n\n"
+            yield "event: done\ndata: {}\n\n"
+        return Response(stream_with_context(_err_gen()),
+                        mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    pinned_tables = self._resolve_pinned(pinned_tables)
+    if not pipeline.has_tables():
+        def _err_gen():
+            yield f"event: pipeline_error\ndata: {json.dumps({'error': 'No tables loaded'})}\n\n"
+            yield "event: done\ndata: {}\n\n"
+        return Response(stream_with_context(_err_gen()),
+                        mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    # ── Token Management: Reserve tokens upfront ──
-    user_id = None
-    reserve_result = None
-    estimated_tokens = 0
+    # ── Token Management: Get user info ──
+    username = session.get("username")
+    request_id = str(uuid.uuid4())  # Unique ID for this request
+
+    def generate():
+        try:
+            yield ": keep-alive\n\n"   # first byte flushes headers immediately
+            
+            # ── Call pipeline with token tracking ──
+            for chunk in pipeline.stream_query(
+                question=question,
+                pinned_tables=pinned,
+                max_retries=max_retries,
+                username=username,        # ← NEW: for token tracking
+                request_id=request_id,    # ← NEW: for transaction logging
+            ):
+                yield chunk
+                
+        except Exception as exc:
+            import traceback
+            logger.error("stream_query error: %s", traceback.format_exc())
+            yield f"event: pipeline_error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+            yield "event: done\ndata: {}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",   # disables nginx buffering
+            "Connection":       "keep-alive",
+        },
+    )
+
+
+
+
+-------
+
+
+@app.route("/health", methods=["GET"])
+@login_required    
+def health():
+    """Quick liveness check — now includes token balance."""
+    from token_manager import get_wallet, _get_user_id
     
-    if TOKEN_MANAGER_AVAILABLE and username:
+    base_response = {
+        "tables_loaded": len(pipeline.loader.table_names()),
+        "table_names":   pipeline.loader.table_names(),
+        "timestamp":     datetime.utcnow().isoformat() + "Z",
+    }
+    
+    # Add token balance if user is logged in
+    username = session.get("username")
+    if username:
         try:
             user_id = _get_user_id(username)
             if user_id:
-                estimated_tokens = estimate_query_tokens(question)
-                request_id = request_id or str(uuid.uuid4())
-                
-                reserve_result = reserve_tokens(
-                    user_id=user_id,
-                    amount=estimated_tokens,
-                    request_id=request_id,
-                    model_name=GEMINI_MODEL
-                )
-                
-                if not reserve_result['success']:
-                    yield f"event: pipeline_error\ndata: {json.dumps({'error': reserve_result['message']})}\n\n"
-                    yield "event: done\ndata: {}\n\n"
-                    return
-                
-                # Emit token reserved event
-                yield f"event: tokens_reserved\ndata: {json.dumps({\n    'reserved': estimated_tokens,\n    'balance': reserve_result['wallet']['available_tokens']\n})}\n\n"
+                wallet = get_wallet(user_id)
+                if wallet:
+                    base_response["token_balance"] = {
+                        "available": wallet["available_tokens"],
+                        "total_allocated": wallet["total_allocated"],
+                        "warn": wallet["warn"],
+                        "blocked": wallet["blocked"],
+                    }
         except Exception as e:
-            logger.warning("Token reservation failed: %s", e)
-            # Continue without token tracking — don't block the query
+            logger.debug("Could not fetch token balance: %s", e)
+    
+    return _ok(base_response)
 
-    def sse(event: str, data: dict) -> str:
-        return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
-    # ── Agent 0: Table selection ──
-    try:
-        if pinned_tables:
-            pinned_schema = self.loader.all_tables_summary_compact_for(pinned_tables)
-            relevant, selector_reasoning , enriched_query= self._selector.select(
-                all_schemas=pinned_schema,
-                question=question,
-                available_tables=pinned_tables,
-                pinned_tables=None,
-                token_log = token_log,
-            )
-        else:
-            relevant, selector_reasoning, enriched_query = self._selector.select(
-                all_schemas=self.loader.all_tables_summary_compact(),
-                question=question,
-                available_tables=self.loader.table_names(),
-                pinned_tables=None,
-                token_log=token_log
-            )
-    except Exception as exc:
-        yield sse("pipeline_error", {"error": f"Table selection failed: {exc}"})
-        yield sse("done", {})
-        return
 
-    if not pinned_tables and len(relevant) > 5:
-        relevant = relevant[:5]
+-----------------------------
 
-    yield sse("tables_selected", {
-        "tables":    relevant,
-        "reasoning": selector_reasoning,
-        "enriched_query": enriched_query,
-    })
 
-    schema  = self.loader.schema_for_tables(relevant)
-    dialect = "mssql" if self.loader.uses_mssql_tables(relevant) else "duckdb"
 
-    prev_sql   = None
-    error      = None
-    lint_warns = []
-
-    # ── Agent 1 + 2: SQL generation + validation loop ──
-    for attempt in range(1, max_retries + 2):
-        try:
-            sql = self._gen_chain.generate(
-                schema=schema,
-                question=question,
-                enriched_query=enriched_query,
-                prev_sql=prev_sql,
-                error=error,
-                lint_warnings=lint_warns,
-                dialect=dialect,
-                token_log = token_log,  # ← This collects tokens from Gemini
-            )
-        except Exception as exc:
-            yield sse("pipeline_error", {"error": f"SQL generation failed: {exc}"})
-            yield sse("done", {})
-            return
-
-        yield sse("sql_generated", {"sql": sql, "attempt": attempt})
-
-        is_valid, result_df, val_error, lint_warns = self._validator.validate(
-            sql=sql, schema=schema, question=question, tables_used=relevant, 
-            skip_semantic = attempt > 1, token_log = token_log,
-        )
-
-        if is_valid:
-            # ── Build result payload ──
-            rows, cols, data = _df_to_response(result_df)
-            csv_path = None
-            if not result_df.empty:
-                csv_path = str(_output_csv_path(question))
-                result_df.to_csv(csv_path, index=False)
-
-            yield sse("result", {
-                "sql":         sql,
-                "rows":        rows,
-                "columns":     cols,
-                "data":        data,
-                "tables_used": relevant,
-                "attempts":    attempt,
-                "output_csv":  csv_path,
-                "reasoning":   selector_reasoning,
-            })
-
-            # ── Agent 3: Viz metadata ──
-            viz = self._viz_agent.generate(
-                question=question,
-                sql=sql,
-                columns=cols,
-                sample_data=data,
-                token_log=token_log,  # ← Collects more tokens
-            )
-
-            self._save_query_result(
-                question          = question,
-                enriched_query    = enriched_query,
-                sql               = sql,
-                relevant          = relevant,
-                rows              = rows,
-                cols              = cols,
-                data              = data,
-                selector_reasoning= selector_reasoning,
-                viz_meta          = viz,
-                csv_path          = csv_path,
-            )
-
-            yield sse("viz_meta", {
-                "chart_type":     viz.chart_type,
-                "title":          viz.title,
-                "x_axis":         viz.x_axis,
-                "x_axis_label":   viz.x_axis_label, 
-                "y_axis":         viz.y_axis,
-                "y_axis_label":   viz.y_axis_label, 
-                "secondary_axis": viz.secondary_axis,
-                "series_label":   viz.series_label,
-                "reasoning":      viz.reasoning,
-            })
-
-            # ── Agent 4: Plotly chart ──
-            plotly_result = self._plotly.generate(
-                question=question,
-                viz_meta=viz,
-                columns=cols,
-                data=data,
-                token_log=token_log,  # ← Collects more tokens
-            )
-
-            # Reconcile chart type
-            chart_type_changed = (
-                plotly_result.actual_chart_type and
-                plotly_result.actual_chart_type != viz.chart_type
-            )
-            if chart_type_changed:
-                logger.info(
-                    "Reconciling viz_meta chart_type: '%s' → '%s'",
-                    viz.chart_type, plotly_result.actual_chart_type,
-                )
-                viz.chart_type = plotly_result.actual_chart_type
-
-            yield sse("chart_ready", {
-                "output_html":      plotly_result.output_html,
-                "plotly_code":      plotly_result.code,
-                "error":            plotly_result.error,
-                "actual_chart_type": viz.chart_type,
-                "chart_type_changed": chart_type_changed,
-            })
-
-            # ── Token Management: Calculate actual usage & adjust ──
-            if TOKEN_MANAGER_AVAILABLE and user_id and reserve_result:
-                try:
-                    # Sum all tokens collected during the pipeline
-                    actual_tokens_used = sum(token_log) if token_log else 0
-                    
-                    # Adjust: refund unused or deduct extra
-                    adjust_result = adjust_tokens(
-                        user_id=user_id,
-                        reserved=estimated_tokens,
-                        actual=actual_tokens_used,
-                        request_id=request_id,
-                        model_name=GEMINI_MODEL
-                    )
-                    
-                    # Emit token adjustment event
-                    yield f"event: tokens_adjusted\ndata: {json.dumps({\n    'actual_used': actual_tokens_used,\n    'refunded': estimated_tokens - actual_tokens_used,\n    'balance': adjust_result['wallet']['available_tokens']\n})}\n\n"
-                    
-                    # Optional: call external callback if provided
-                    if self._token_callback:
-                        self._token_callback(actual_tokens_used)
-                        
-                except Exception as e:
-                    logger.warning("Token adjustment failed: %s", e)
-                    # Don't fail the query — just log
-
-            yield sse("done", {"total_tokens": sum(token_log)})
-            return
-
-        else:
-            yield sse("sql_error", {
-                "error":   val_error,
-                "attempt": attempt,
-                "sql":     sql,
-            })
-            prev_sql = sql
-            error    = val_error
-            if attempt > max_retries:
-                break
-
-    # ── Pipeline failed: Refund reserved tokens ──
-    if TOKEN_MANAGER_AVAILABLE and user_id and reserve_result:
-        try:
-            refund_tokens(
-                user_id=user_id,
-                amount=estimated_tokens,
-                request_id=request_id,
-                reason='pipeline_failed'
-            )
-            yield f"event: tokens_refunded\ndata: {json.dumps({\n    'refunded': estimated_tokens,\n    'reason': 'pipeline_failed'\n})}\n\n"
-        except Exception as e:
-            logger.warning("Token refund on failure failed: %s", e)
-
-    yield sse("pipeline_error", {
-        "error": f"Pipeline failed after {max_retries + 1} attempts. Last error: {error}"
-    })
-    yield sse("done", {})
