@@ -1,13 +1,11 @@
-# migration_add_id_and_wallets.py
+# migration_safe.py
 """
-One-time migration to:
-1. Add id column to nlq_user_details
-2. Create nlq_token_wallets table
-3. Create nlq_token_transactions table
-4. Migrate existing api_tokens data to wallets
+Safe, Idempotent Migration Script.
+Safe to run multiple times. It checks what exists and skips what's done.
 """
 
 import pymysql
+import pymysql.cursors  # <-- IMPORTANT FIX
 import os
 from dotenv import load_dotenv
 
@@ -19,117 +17,136 @@ MYSQL_USER = os.environ.get("AUTH_MYSQL_USER", "nabh")
 MYSQL_PASS = os.environ.get("AUTH_MYSQL_PASS", "nabh@2026")
 MYSQL_DB   = os.environ.get("AUTH_MYSQL_DB", "NABH")
 
+def column_exists(cursor, table, column):
+    cursor.execute("""
+        SELECT COUNT(*) as cnt FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+    """, (MYSQL_DB, table, column))
+    return cursor.fetchone()['cnt'] > 0
+
+def table_exists(cursor, table):
+    cursor.execute("""
+        SELECT COUNT(*) as cnt FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+    """, (MYSQL_DB, table))
+    return cursor.fetchone()['cnt'] > 0
+
 def migrate():
+    # DictCursor is essential for 'row["id"]' syntax
     conn = pymysql.connect(
         host=MYSQL_HOST,
         port=MYSQL_PORT,
         user=MYSQL_USER,
         password=MYSQL_PASS,
         database=MYSQL_DB,
+        cursorclass=pymysql.cursors.DictCursor,  # <-- FIXES YOUR ERROR
         autocommit=False
     )
     
     try:
         with conn.cursor() as cur:
-            # 1. Add id column to nlq_user_details
-            print("Adding id column to nlq_user_details...")
-            cur.execute("""
-                ALTER TABLE nlq_user_details 
-                ADD COLUMN id BIGINT AUTO_INCREMENT PRIMARY KEY FIRST
-            """)
             
-            # 2. Create token_wallets table
-            print("Creating nlq_token_wallets table...")
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS nlq_token_wallets (
-                    user_id BIGINT PRIMARY KEY,
-                    total_allocated BIGINT NOT NULL DEFAULT 0,
-                    total_used BIGINT NOT NULL DEFAULT 0,
-                    available_tokens BIGINT NOT NULL DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    FOREIGN KEY (user_id) REFERENCES nlq_user_details(id) ON DELETE CASCADE
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
+            # 1. Check/Add ID Column
+            if column_exists(cur, 'nlq_user_details', 'id'):
+                print("✅ Column 'id' already exists.")
+            else:
+                print("➕ Adding 'id' column...")
+                cur.execute("ALTER TABLE nlq_user_details ADD COLUMN id BIGINT AUTO_INCREMENT PRIMARY KEY FIRST")
+                conn.commit()
+                print("✅ Column 'id' added.")
+
+            # 2. Check/Create Wallets Table
+            if table_exists(cur, 'nlq_token_wallets'):
+                print("✅ Table 'nlq_token_wallets' already exists.")
+            else:
+                print("➕ Creating 'nlq_token_wallets' table...")
+                cur.execute("""
+                    CREATE TABLE nlq_token_wallets (
+                        user_id BIGINT PRIMARY KEY,
+                        total_allocated BIGINT NOT NULL DEFAULT 0,
+                        total_used BIGINT NOT NULL DEFAULT 0,
+                        available_tokens BIGINT NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMP DEFAULT NOW(),
+                        FOREIGN KEY (user_id) REFERENCES nlq_user_details(id) ON DELETE CASCADE
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                conn.commit()
+                print("✅ Table 'nlq_token_wallets' created.")
+
+            # 3. Check/Create Transactions Table
+            if table_exists(cur, 'nlq_token_transactions'):
+                print("✅ Table 'nlq_token_transactions' already exists.")
+            else:
+                print("➕ Creating 'nlq_token_transactions' table...")
+                cur.execute("""
+                    CREATE TABLE nlq_token_transactions (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        type VARCHAR(20) NOT NULL,
+                        tokens BIGINT NOT NULL,
+                        request_id VARCHAR(100),
+                        model_name VARCHAR(100),
+                        balance_before BIGINT,
+                        balance_after BIGINT,
+                        metadata JSON,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        FOREIGN KEY (user_id) REFERENCES nlq_user_details(id) ON DELETE CASCADE,
+                        INDEX idx_user_id (user_id),
+                        INDEX idx_created_at (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                conn.commit()
+                print("✅ Table 'nlq_token_transactions' created.")
+
+            # 4. Migrate Data (Only if not already done)
+            print(" Checking for data to migrate...")
             
-            # 3. Create token_transactions table
-            print("Creating nlq_token_transactions table...")
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS nlq_token_transactions (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    type VARCHAR(20) NOT NULL,
-                    tokens BIGINT NOT NULL,
-                    request_id VARCHAR(100),
-                    model_name VARCHAR(100),
-                    balance_before BIGINT,
-                    balance_after BIGINT,
-                    metadata JSON,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    FOREIGN KEY (user_id) REFERENCES nlq_user_details(id) ON DELETE CASCADE,
-                    INDEX idx_user_id (user_id),
-                    INDEX idx_created_at (created_at),
-                    INDEX idx_request_id (request_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            
-            # 4. Migrate existing api_tokens data to wallets
-            print("Migrating existing token data...")
-            cur.execute("""
-                SELECT id, username, api_tokens 
-                FROM nlq_user_details 
-                WHERE api_tokens IS NOT NULL
-            """)
-            users = cur.fetchall()
-            
-            migrated = 0
-            for user in users:
-                user_id = user['id']
-                api_tokens = user['api_tokens']
+            # Check if api_tokens column exists (it might have been dropped already)
+            if not column_exists(cur, 'nlq_user_details', 'api_tokens'):
+                print("ℹ️  'api_tokens' column not found (or already dropped). Skipping migration.")
+            else:
+                # Check if wallets already have data
+                cur.execute("SELECT COUNT(*) as cnt FROM nlq_token_wallets")
+                wallet_count = cur.fetchone()['cnt']
                 
-                if api_tokens:
-                    # Parse "available/total" format
-                    if '/' in str(api_tokens):
-                        parts = str(api_tokens).split('/')
-                        available = int(parts[0])
-                        total = int(parts[1])
-                    else:
-                        # Plain integer
-                        available = int(api_tokens)
-                        total = int(api_tokens)
+                if wallet_count > 0:
+                    print(f"ℹ️  {wallet_count} wallets already exist. Skipping migration to prevent duplicates.")
+                else:
+                    print("➕ Migrating data from 'api_tokens'...")
+                    cur.execute("SELECT id, api_tokens FROM nlq_user_details WHERE api_tokens IS NOT NULL")
+                    users = cur.fetchall()
                     
-                    # Insert into wallet
-                    cur.execute("""
-                        INSERT INTO nlq_token_wallets 
-                        (user_id, total_allocated, total_used, available_tokens, updated_at)
-                        VALUES (%s, %s, 0, %s, NOW())
-                        ON DUPLICATE KEY UPDATE
-                            total_allocated = VALUES(total_allocated),
-                            available_tokens = VALUES(available_tokens),
-                            updated_at = NOW()
-                    """, (user_id, total, available))
+                    migrated = 0
+                    for user in users:
+                        api_tokens = user['api_tokens']
+                        if api_tokens:
+                            if '/' in str(api_tokens):
+                                parts = str(api_tokens).split('/')
+                                total, available = int(parts[1]), int(parts[0])
+                            else:
+                                total, available = int(api_tokens), int(api_tokens)
+                            
+                            cur.execute("""
+                                INSERT INTO nlq_token_wallets 
+                                (user_id, total_allocated, available_tokens)
+                                VALUES (%s, %s, %s)
+                            """, (user['id'], total, available))
+                            
+                            cur.execute("""
+                                INSERT INTO nlq_token_transactions
+                                (user_id, type, tokens, balance_before, balance_after, metadata)
+                                VALUES (%s, 'MIGRATE', %s, 0, %s, 'initial_migration')
+                            """, (user['id'], total, available))
+                            migrated += 1
                     
-                    # Log allocation transaction
-                    cur.execute("""
-                        INSERT INTO nlq_token_transactions
-                        (user_id, type, tokens, balance_before, balance_after, metadata)
-                        VALUES (%s, 'ALLOCATE', %s, 0, %s, JSON_OBJECT('migrated', true, 'note', 'Initial migration'))
-                    """, (user_id, total, available))
-                    
-                    migrated += 1
-            
-            print(f"Migrated {migrated} users to wallet system")
-            
-            # 5. Optional: Drop old api_tokens column after verification
-            # Uncomment after verifying migration:
-            # print("Dropping old api_tokens column...")
-            # cur.execute("ALTER TABLE nlq_user_details DROP COLUMN api_tokens")
-            
-        conn.commit()
-        print("✅ Migration completed successfully!")
+                    conn.commit()
+                    print(f"✅ Migrated {migrated} users.")
+
+        print("\n🎉 Migration finished successfully!")
         
     except Exception as e:
         conn.rollback()
-        print(f"❌ Migration failed: {e}")
+        print(f"\n❌ Failed: {e}")
         raise
     finally:
         conn.close()
