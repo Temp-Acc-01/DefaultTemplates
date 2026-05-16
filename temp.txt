@@ -1,46 +1,55 @@
-.sidebar-actions {
-    height: 56px;
-    min-height: 56px;
-    padding: 0 12px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    gap: 6px;
-    flex-shrink: 0;
-  }
-
-
-
--------------
-
-
-.sidebar-action-btn {
+.token-info-icon {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 5px;
-    padding: 6px 10px;
-    border-radius: var(--radius-sm);
-    font-size: 11.5px;
-    font-family: 'DM Sans', sans-serif;
-    font-weight: 500;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: transparent;
+    border: none;
     cursor: pointer;
-    transition: background 0.12s, color 0.12s, border-color 0.12s;
-    border: 1px solid transparent;
-    flex: 1;
-    white-space: nowrap;
+    color: var(--text-muted);
+    padding: 0;
+    margin-left: 4px;
+    transition: color 0.12s;
+    flex-shrink: 0;
   }
+  .token-info-icon:hover { color: var(--blue-600); }
+  .token-info-icon svg { width: 15px; height: 15px; }
 
 
-------------------
+-------------------
 
 
-.logo-sub { font-size: 10px; color: var(--text-muted); letter-spacing: 0.8px; text-transform: uppercase; font-weight: 500; margin-top: 0; }
-  .sidebar-header .logo > div { display: flex; align-items: baseline; gap: 7px; }
+<div class="token-pill" id="token-pill">
+          <span style="font-size:10px;font-weight:600;color:inherit;opacity:0.7;letter-spacing:0.3px;margin-right:1px;">Available Tokens</span>
+          <span id="token-text">—</span>
+          <button class="token-info-icon" id="token-info-btn"
+            onclick="toggleTokenBubble(event)"
+            title="Token details">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10
+                       10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
+            </svg>
+          </button>
+        </div>
 
 
 
-------------------
+--------------
 
+
+
+txt.textContent = fmtTokens(tokenState.available);
+
+
+
+
+----------
+
+
+if (tibAlloc) tibAlloc.textContent = (tokenState.total ?? 0).toLocaleString();
+  if (tibUsed)  tibUsed.textContent  = ((tokenState.total ?? 0) - (tokenState.available ?? 0)).toLocaleString();
+  if (tibAvail) {
+    tibAvail.textContent = (tokenState.available ?? 0).toLocaleString();
 
