@@ -1,387 +1,296 @@
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-
-
-------------
-
-
-/* ══ SIDEBAR OVERLAY (mobile) ══ */
-  .sidebar-overlay {
-    display: none;
+/* ── RESPONSIVE OVERRIDES ── */
+@media (max-width: 768px) {
+  /* Sidebar collapsed state */
+  .sidebar.collapsed {
+    transform: translateX(-100%);
+    box-shadow: none;
+  }
+  
+  /* Hamburger toggle button */
+  .sidebar-toggle {
+    display: flex !important;
     position: fixed;
-    inset: 0;
-    background: rgba(15,25,50,0.35);
-    backdrop-filter: blur(2px);
-    z-index: 200;
-  }
-  .sidebar-overlay.visible { display: block; }
-
-  /* ══ SIDEBAR TOGGLE BUTTON (shown when sidebar closed) ══ */
-  .sidebar-toggle-btn {
-    display: none;
-    width: 32px; height: 32px;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border);
+    top: 12px;
+    left: 12px;
+    z-index: 2000;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
     background: var(--surface);
-    color: var(--text-muted);
-    align-items: center; justify-content: center;
-    cursor: pointer;
-    flex-shrink: 0;
-    transition: background 0.12s, color 0.12s;
-  }
-  .sidebar-toggle-btn:hover { background: var(--slate-100); color: var(--text-primary); }
-  .sidebar-toggle-btn svg { width: 16px; height: 16px; }
-
-  /* ══ SIDEBAR CLOSE BUTTON (inside sidebar, top right) ══ */
-  .sidebar-close-btn {
-    display: none;
-    width: 28px; height: 28px;
-    border-radius: var(--radius-sm);
     border: 1px solid var(--border);
-    background: transparent;
-    color: var(--text-muted);
-    align-items: center; justify-content: center;
+    align-items: center;
+    justify-content: center;
     cursor: pointer;
-    flex-shrink: 0;
-    margin-left: auto;
-    transition: background 0.12s;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    transition: transform 0.2s, background 0.2s;
   }
-  .sidebar-close-btn:hover { background: var(--slate-100); }
-  .sidebar-close-btn svg { width: 13px; height: 13px; }
+  .sidebar-toggle:hover { background: var(--slate-50); transform: scale(1.05); }
+  .sidebar-toggle svg { width: 20px; height: 20px; color: var(--text-secondary); }
 
-  /* ══ TOPBAR SESSION TITLE (shown when sidebar collapsed) ══ */
-  .topbar-session-prefix {
-    display: none;
+  /* Topbar adjustments */
+  .topbar {
+    padding: 0 16px 0 60px; /* space for hamburger */
+    height: 52px;
+    min-height: 52px;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .topbar-title {
     font-size: 13px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 160px;
-    flex-shrink: 1;
+    flex: 1 1 100%;
+    order: 3;
+    margin-top: 4px;
+    text-align: center;
+  }
+  .topbar-badge, .token-balance-wrap {
+    order: 1;
+    flex: 0 0 auto;
+  }
+  .token-balance-wrap {
+    order: 2;
   }
 
-  /* ══ TABLET: 768px–1024px ══ */
-  @media (max-width: 1024px) {
-    .sidebar {
-      position: fixed;
-      left: 0; top: 0; bottom: 0;
-      width: 260px;
-      z-index: 300;
-      transform: translateX(0);
-      transition: transform 0.25s ease, box-shadow 0.25s ease;
-      box-shadow: 2px 0 24px rgba(15,25,50,0.12);
-    }
-
-    .sidebar.collapsed {
-      transform: translateX(-100%);
-      box-shadow: none;
-    }
-
-    .sidebar-close-btn { display: flex; }
-    .sidebar-toggle-btn { display: flex; }
-    .topbar-session-prefix { display: block; }
-
-    .main { width: 100%; }
-
-    .topbar { padding: 0 14px; gap: 8px; }
-    .topbar-title { display: none; }
-
-    .chat-area { padding: 16px 0; }
-    .msg-row { padding: 5px 14px; }
-    .bubble-wrap { max-width: 90vw; }
-    .msg-row.user .bubble-wrap { max-width: 80vw; }
-
-    .input-area { padding: 10px 14px 14px; }
-
-    /* Token + tables badge compact */
-    .topbar-badge { font-size: 10px; padding: 2px 8px; }
-    .token-pill { font-size: 10px; padding: 2px 8px; }
-    .token-pill span[style*="Available Tokens"] { display: none; }
+  /* Input area fixed at bottom */
+  .input-area {
+    position: fixed !important;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: 12px 16px 16px;
+    z-index: 1000;
+    box-shadow: 0 -2px 12px rgba(0,0,0,0.04);
+  }
+  .input-wrap {
+    border-radius: var(--radius-lg);
+    padding: 8px 10px 8px 14px;
+  }
+  #query-input {
+    font-size: 15px;
+    min-height: 24px;
+    max-height: 100px;
+  }
+  .send-btn {
+    width: 38px;
+    height: 38px;
+  }
+  .input-hint {
+    font-size: 10px;
+    margin-top: 6px;
   }
 
-  /* ══ MOBILE: <768px ══ */
-  @media (max-width: 767px) {
-    .sidebar {
-      position: fixed;
-      left: 0; top: 0; bottom: 0;
-      width: min(280px, 85vw);
-      z-index: 300;
-      transform: translateX(-100%);
-      transition: transform 0.25s ease;
-    }
-
-    .sidebar.open {
-      transform: translateX(0);
-      box-shadow: 4px 0 32px rgba(15,25,50,0.18);
-    }
-
-    .main { width: 100vw; }
-
-    .topbar {
-      height: 48px; min-height: 48px;
-      padding: 0 10px;
-      gap: 8px;
-    }
-
-    /* On mobile topbar: toggle | prefix title | spacer | badge | token */
-    .topbar-title { display: none; }
-    .topbar-session-prefix {
-      display: block;
-      max-width: 120px;
-      font-size: 12.5px;
-    }
-
-    /* Hide token label text on mobile, keep number */
-    .token-pill span[style*="Available Tokens"] { display: none; }
-    .token-pill { font-size: 10px; padding: 2px 7px; }
-    .topbar-badge { font-size: 10px; padding: 2px 7px; }
-
-    /* Hide the info icon on tiny screens */
-    .token-info-icon { display: none; }
-
-    /* Chat area — full width, tighter padding */
-    .chat-area { padding: 12px 0 8px; }
-    .msg-row { padding: 4px 10px; gap: 8px; }
-    .bubble { font-size: 13.5px; padding: 10px 13px; line-height: 1.6; }
-    .bubble-wrap { max-width: 92vw; }
-    .msg-row.user .bubble-wrap { max-width: 82vw; }
-
-    /* Avatar smaller on mobile */
-    .avatar { width: 26px; height: 26px; font-size: 11px; }
-
-    /* Thinking block */
-    .thinking-header { font-size: 12px; padding: 8px 12px; }
-    .thinking-step { font-size: 12px; }
-
-    /* Meta grid — single column on mobile */
-    .meta-grid { grid-template-columns: 1fr; gap: 6px; }
-    .meta-card { padding: 9px 12px; }
-
-    /* Input area — sticky bottom, safe area aware */
-    .input-area {
-      padding: 8px 10px 10px;
-      padding-bottom: max(10px, env(safe-area-inset-bottom));
-      position: sticky;
-      bottom: 0;
-      background: var(--surface);
-      border-top: 1px solid var(--border);
-      z-index: 10;
-    }
-
-    .input-wrap { padding: 8px 8px 8px 14px; border-radius: 20px; }
-    #query-input { font-size: 15px; } /* 15px prevents iOS zoom on focus */
-    .input-hint { font-size: 10px; margin-top: 6px; }
-
-    .send-btn { width: 32px; height: 32px; }
-
-    /* Rows badge compact */
-    .rows-badge { font-size: 11px; padding: 3px 8px; }
-
-    /* Chart iframe — shorter on mobile */
-    .chart-iframe { height: 280px !important; }
-
-    /* Chart frame full width */
-    .chart-frame-wrap { margin-top: 4px; }
-
-    /* Processing bar compact */
-    .processing-bar { font-size: 11.5px; padding: 7px 11px; }
-
-    /* Quota notices */
-    .quota-blocked-notice { font-size: 11.5px; padding: 7px 12px; }
-    .quota-warn-toast { font-size: 11px; padding: 6px 12px; }
-
-    /* Error bubble */
-    .error-bubble { font-size: 12.5px; padding: 9px 12px; }
-
-    /* Sidebar actions stack vertically on narrow sidebar */
-    .sidebar-actions { flex-direction: column; height: auto; padding: 8px 10px; gap: 5px; }
-    .sidebar-action-btn { width: 100%; justify-content: flex-start; }
-
-    /* Modal overlays full screen on mobile */
-    .back-confirm-card,
-    .logout-confirm-card { width: calc(100vw - 32px); max-width: 340px; }
-
-    /* Chart modal full screen */
-    .chart-modal {
-      max-width: 100vw;
-      height: 100vh;
-      border-radius: 0;
-    }
-    .chart-modal-overlay { padding: 0; }
+  /* Chat area padding for fixed input */
+  .chat-area {
+    padding-bottom: 140px !important; /* input height + margin */
+    padding-top: 16px;
   }
 
-  /* ══ VERY SMALL: <400px ══ */
-  @media (max-width: 400px) {
-    .topbar-session-prefix { max-width: 80px; }
-    .topbar-badge { display: none; } /* hide tables badge on tiny screens */
-    .bubble { font-size: 13px; padding: 9px 11px; }
-    .msg-row { padding: 3px 8px; gap: 6px; }
+  /* Message bubbles */
+  .msg-row {
+    padding: 8px 16px;
+    gap: 10px;
+  }
+  .bubble {
+    font-size: 14px;
+    padding: 12px 14px;
+    border-radius: var(--radius-md);
+  }
+  .bubble.user-bubble {
+    border-radius: var(--radius-md) var(--radius-md) 4px var(--radius-md);
+  }
+  .bubble.ai-bubble {
+    border-radius: 4px var(--radius-md) var(--radius-md) var(--radius-md);
+  }
+  .bubble-wrap {
+    max-width: 100%;
+  }
+  .msg-row.user .bubble-wrap {
+    max-width: 85%;
   }
 
-  /* ══ BODY full height for mobile browsers (address bar aware) ══ */
-  body { min-height: 100vh; min-height: -webkit-fill-available; }
-  html { height: -webkit-fill-available; }
+  /* Thinking block mobile */
+  .thinking-header {
+    font-size: 12px;
+    padding: 8px 12px;
+  }
+  .thinking-step {
+    font-size: 12px;
+    padding: 6px 0;
+  }
+  .step-icon {
+    width: 16px;
+    height: 16px;
+    font-size: 9px;
+  }
 
-  /* ══ Prevent horizontal scroll ══ */
-  body, .main { overflow-x: hidden; }
+  /* Meta grid stacks on mobile */
+  .meta-grid {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
 
+  /* Chart iframe height */
+  .chart-iframe {
+    height: 320px;
+  }
 
-------------------
+  /* Sidebar actions stack */
+  .sidebar-actions {
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    height: auto;
+  }
+  .sidebar-action-btn {
+    width: 100%;
+    justify-content: center;
+  }
 
+  /* Token info bubble reposition */
+  .token-info-bubble {
+    right: auto;
+    left: 0;
+    top: calc(100% + 8px);
+    min-width: 200px;
+  }
+  .tib-arrow {
+    right: auto;
+    left: 16px;
+  }
 
+  /* Quota notices full width */
+  .quota-blocked-notice,
+  .quota-warn-toast {
+    margin: 0 -16px 12px;
+    border-radius: 0;
+    padding: 10px 16px;
+  }
+}
 
-<aside class="sidebar" id="sidebar">
-    <!-- Sidebar close button (tablet/mobile) -->
-    <div style="display:flex; align-items:center; padding:6px 10px 0; flex-shrink:0;">
-      <button class="sidebar-close-btn" id="sidebar-close-btn" onclick="closeSidebar()" title="Close sidebar">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-          <path d="M18 6L6 18M6 6l12 12"/>
-        </svg>
-      </button>
-    </div>
-    <!-- ── Back + Logout in sidebar ── -->
-    <div class="sidebar-actions">
-      <button class="sidebar-action-btn back" onclick="confirmBackToDashboard()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-             stroke-linecap="round" stroke-linejoin="round">
-          <path d="M19 12H5M12 5l-7 7 7 7"/>
-        </svg>
-        Back to dashboard
-      </button>
-      <button class="sidebar-action-btn logout" onclick="confirmLogout()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-             stroke-linecap="round" stroke-linejoin="round">
-          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
-          <polyline points="16 17 21 12 16 7"/>
-          <line x1="21" y1="12" x2="9" y2="12"/>
-        </svg>
-        Logout
-      </button>
-    </div>
+/* Tablet range */
+@media (min-width: 769px) and (max-width: 1024px) {
+  .sidebar { width: 200px; min-width: 200px; }
+  .topbar { padding: 0 20px; }
+  .chat-area { padding-bottom: 0; }
+  .input-area { position: static; padding: 16px 24px 20px; }
+}
 
+/* Desktop: ensure sidebar toggle hidden */
+@media (min-width: 1025px) {
+  .sidebar-toggle { display: none !important; }
+  .sidebar { transform: translateX(0) !important; }
+}
 
----------------
+/* ── Smooth transitions for sidebar toggle ── */
+.sidebar {
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.3s ease;
+  will-change: transform;
+}
 
+/* Prevent layout shift when sidebar collapses */
+.main {
+  transition: margin-left 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.sidebar.collapsed + .main {
+  margin-left: 0;
+}
 
-<!-- Sidebar overlay (mobile backdrop) -->
-<div class="sidebar-overlay" id="sidebar-overlay" onclick="closeSidebar()"></div>
-
-<aside class="sidebar" id="sidebar">
-
-
-
-------------
-
-<div class="topbar">
-    <!-- Sidebar toggle (shown when sidebar collapsed on tablet/mobile) -->
-    <button class="sidebar-toggle-btn" id="sidebar-toggle-btn" onclick="openSidebar()" title="Open sidebar">
-      <svg viewBox="0 0 24 24" fill="currentColor">
-        <path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/>
-      </svg>
-    </button>
-    <!-- Session title prefix (mobile, shown when sidebar closed) -->
-    <span class="topbar-session-prefix" id="topbar-session-prefix">New conversation</span>
-    <span class="topbar-title" id="session-title">New conversation</span>
-
-
+/* ── Touch-friendly improvements ── */
+@media (hover: none) and (pointer: coarse) {
+  .send-btn, .sidebar-toggle, .chart-open-btn,
+  .sql-copy-btn, .copy-prompt-btn {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 8px;
+  }
+  .history-item, .sidebar-action-btn {
+    min-height: 44px;
+    padding: 10px 12px;
+  }
+}
 
 
 ----------------
 
-// ─── Sidebar open/close (tablet/mobile) ──────────────────────────
-function openSidebar() {
-  document.getElementById('sidebar').classList.add('open');
-  document.getElementById('sidebar-overlay').classList.add('visible');
-  document.body.style.overflow = 'hidden';
-}
 
-function closeSidebar() {
-  const sidebar = document.getElementById('sidebar');
-  sidebar.classList.remove('open');
-  sidebar.classList.remove('collapsed');
-  document.getElementById('sidebar-overlay').classList.remove('visible');
-  document.body.style.overflow = '';
-}
 
-// Detect viewport and auto-collapse sidebar on small screens
-function handleViewportResize() {
-  const sidebar = document.getElementById('sidebar');
-  const toggleBtn = document.getElementById('sidebar-toggle-btn');
-  const prefix = document.getElementById('topbar-session-prefix');
-  const w = window.innerWidth;
 
-  if (w <= 1024) {
-    // Tablet/mobile: sidebar is overlay, toggle button visible
-    if (toggleBtn) toggleBtn.style.display = 'flex';
-    // On mobile default closed, on tablet default closed too
-    if (!sidebar.classList.contains('open')) {
-      sidebar.classList.add('collapsed');
-    }
-  } else {
-    // Desktop: sidebar always visible
-    sidebar.classList.remove('collapsed', 'open');
-    document.getElementById('sidebar-overlay').classList.remove('visible');
-    if (toggleBtn) toggleBtn.style.display = 'none';
-    document.body.style.overflow = '';
+<!-- Hamburger toggle button (mobile only) -->
+<button class="sidebar-toggle" id="sidebar-toggle" onclick="toggleSidebar()" title="Toggle sidebar" style="display:none;">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="3" y1="12" x2="21" y2="12"></line>
+    <line x1="3" y1="6" x2="21" y2="6"></line>
+    <line x1="3" y1="18" x2="21" y2="18"></line>
+  </svg>
+</button>
+
+
+--------------
+
+
+// ── Sidebar Toggle Logic ──
+function toggleSidebar() {
+  const sidebar = document.querySelector('.sidebar');
+  const toggleBtn = document.getElementById('sidebar-toggle');
+  const isCollapsed = sidebar.classList.toggle('collapsed');
+  
+  // Update hamburger icon
+  if (toggleBtn) {
+    toggleBtn.innerHTML = isCollapsed 
+      ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>`
+      : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>`;
   }
+  
+  // Save preference
+  localStorage.setItem('sidebarCollapsed', isCollapsed ? '1' : '0');
+  
+  // Re-flow chat area
+  setTimeout(() => {
+    const area = document.getElementById('chat-area');
+    if (area) area.scrollTop = area.scrollHeight;
+  }, 300);
 }
 
-// Keep session prefix in topbar in sync with session title
-function syncTopbarPrefix() {
-  const title = document.getElementById('session-title');
-  const prefix = document.getElementById('topbar-session-prefix');
-  if (prefix && title) prefix.textContent = title.textContent;
-}
+// Init sidebar state on load
+document.addEventListener('DOMContentLoaded', () => {
+  // Show toggle button on mobile
+  if (window.innerWidth <= 768) {
+    document.getElementById('sidebar-toggle').style.display = 'flex';
+  }
+  
+  // Restore saved state
+  const saved = localStorage.getItem('sidebarCollapsed');
+  if (saved === '1' && window.innerWidth <= 768) {
+    document.querySelector('.sidebar')?.classList.add('collapsed');
+    const btn = document.getElementById('sidebar-toggle');
+    if (btn) btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>`;
+  }
+  
+  // Handle resize
+  window.addEventListener('resize', () => {
+    const toggle = document.getElementById('sidebar-toggle');
+    if (window.innerWidth <= 768) {
+      if (toggle) toggle.style.display = 'flex';
+    } else {
+      if (toggle) toggle.style.display = 'none';
+      document.querySelector('.sidebar')?.classList.remove('collapsed');
+    }
+  });
+});
 
-window.addEventListener('resize', handleViewportResize);
-handleViewportResize();
-
-// Patch newChat and switchSession to sync prefix
-const _origNewChat = newChat;
-newChat = function() {
-  _origNewChat();
-  syncTopbarPrefix();
-};
-const _origSwitchSession = switchSession;
-switchSession = function(id) {
-  _origSwitchSession(id);
-  syncTopbarPrefix();
-  // Close sidebar on mobile after selecting session
-  if (window.innerWidth <= 1024) closeSidebar();
-};
-
-// Close sidebar on mobile when new chat starts
-const _origNewChatBtn = newChat;
-
-
-
-
-
-
-
-
-
-
-
-
-
-------
-document.getElementById('session-title').textContent = currentSession.title;
-    syncTopbarPrefix();
-    renderHistory();
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// Close sidebar when clicking outside on mobile (optional)
+document.addEventListener('click', (e) => {
+  if (window.innerWidth > 768) return;
+  const sidebar = document.querySelector('.sidebar');
+  const toggle = document.getElementById('sidebar-toggle');
+  if (!sidebar || !toggle) return;
+  
+  if (sidebar.classList.contains('collapsed') && 
+      !sidebar.contains(e.target) && 
+      !toggle.contains(e.target)) {
+    // Optional: auto-close when clicking chat area
+    // toggleSidebar();
+  }
+});
