@@ -1,24 +1,513 @@
-case 'tokens_adjusted': {
-  // Update token state with actual balance from backend
-  if (payload.balance !== undefined) {
-    tokenState.available = payload.balance;
-    tokenState.warn = payload.balance <= 25000 && payload.balance > 0;
-    tokenState.blocked = payload.balance <= 0;
-    
-    // Update UI immediately
-    updateTokenUI();
-    
-    // Show refund message if applicable
-    const refundMsg = payload.refunded > 0 
-      ? `✓ Refunded ${payload.refunded.toLocaleString()} unused tokens` 
-      : `✓ Used ${payload.actual_used.toLocaleString()} tokens`;
-    
-    const notice = document.createElement('div');
-    notice.className = 'retry-notice';
-    notice.style.cssText = 'background:#E8F5E9;color:#2E7D32;border-color:#A5D6A7;';
-    notice.innerHTML = refundMsg;
-    bw.appendChild(notice);
-    scrollToBottom();
+SARTHI_INDEX.HTML — UI IMPROVEMENT PATCHES
+==========================================
+Apply all 6 patches in order. Each shows exact FIND and REPLACE WITH.
+
+
+═══════════════════════════════════════════════════════════════
+PATCH 1 — Add CSS for sidebar action buttons + token info bubble
+         Add inside <style>, just before closing </style>
+═══════════════════════════════════════════════════════════════
+
+ADD THIS BLOCK just before </style>:
+
+  /* ── Sidebar action buttons (Back + Logout) ── */
+  .sidebar-actions {
+    padding: 12px 16px 10px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
   }
-  break;
+
+  .sidebar-action-btn {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 12px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+    border: 1px solid transparent;
+    width: 100%;
+    text-align: left;
+  }
+
+  .sidebar-action-btn svg { width: 13px; height: 13px; flex-shrink: 0; }
+
+  .sidebar-action-btn.back {
+    color: #9B4040;
+    background: #FDF1F1;
+    border-color: #F2CACA;
+  }
+  .sidebar-action-btn.back:hover {
+    background: #F9E3E3;
+    border-color: #E8AFAF;
+    color: #7A2E2E;
+  }
+
+  .sidebar-action-btn.logout {
+    color: var(--text-muted);
+    background: transparent;
+    border-color: var(--border);
+  }
+  .sidebar-action-btn.logout:hover {
+    background: var(--slate-100);
+    border-color: var(--border-md);
+    color: var(--text-secondary);
+  }
+
+  /* ── Token info bubble ── */
+  .token-info-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .token-info-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: var(--text-muted);
+    padding: 0;
+    margin-left: 3px;
+    transition: color 0.12s;
+    flex-shrink: 0;
+  }
+  .token-info-icon:hover { color: var(--blue-600); }
+  .token-info-icon svg { width: 13px; height: 13px; }
+
+  .token-info-bubble {
+    display: none;
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    background: var(--slate-900);
+    color: #fff;
+    border-radius: var(--radius-md);
+    padding: 10px 13px;
+    min-width: 180px;
+    z-index: 500;
+    box-shadow: 0 6px 20px rgba(15,25,50,0.22);
+    animation: fadeUp 0.15s ease;
+  }
+  .token-info-bubble.open { display: block; }
+
+  .tib-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    padding: 3px 0;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .tib-row:not(:last-child) {
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    padding-bottom: 5px;
+    margin-bottom: 2px;
+  }
+  .tib-label { color: rgba(255,255,255,0.55); font-weight: 400; }
+  .tib-val   { color: #fff; font-weight: 600; font-size: 11.5px; }
+  .tib-val.available { color: #6EE7B7; }
+  .tib-val.warn      { color: #FCD34D; }
+  .tib-val.blocked   { color: #FCA5A5; }
+
+  .tib-arrow {
+    position: absolute;
+    top: -5px;
+    right: 12px;
+    width: 10px;
+    height: 10px;
+    background: var(--slate-900);
+    transform: rotate(45deg);
+    border-radius: 2px;
+  }
+
+
+═══════════════════════════════════════════════════════════════
+PATCH 2 — Add sidebar action buttons ABOVE the logo
+         In the <aside class="sidebar"> block
+═══════════════════════════════════════════════════════════════
+
+FIND (the very start of the sidebar):
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">
+
+REPLACE WITH:
+  <aside class="sidebar">
+    <!-- ── Back + Logout in sidebar ── -->
+    <div class="sidebar-actions">
+      <button class="sidebar-action-btn back" onclick="confirmBackToDashboard()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 12H5M12 5l-7 7 7 7"/>
+        </svg>
+        Back to dashboard
+      </button>
+      <button class="sidebar-action-btn logout" onclick="confirmLogout()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+          <polyline points="16 17 21 12 16 7"/>
+          <line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+        Logout
+      </button>
+    </div>
+    <div class="sidebar-header">
+      <div class="logo">
+
+
+═══════════════════════════════════════════════════════════════
+PATCH 3 — Remove old Back + Logout button blocks from topbar
+═══════════════════════════════════════════════════════════════
+
+FIND AND DELETE this entire block from inside <div class="topbar">:
+
+    <div class="back-btn-wrap" title="">
+      <button class="back-btn" onclick="confirmBackToDashboard()">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 12H5M12 5l-7 7 7 7"/>
+        </svg>
+        Back
+      </button>
+      <div class="back-btn-tooltip">Back to dashboard</div>
+    </div>
+    <div class="logout-btn-wrap">
+      <button class="logout-btn" onclick="confirmLogout()">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none"
+             stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+          <polyline points="16 17 21 12 16 7"/>
+          <line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+        Logout
+      </button>
+      <div class="logout-btn-tooltip">Sign out of Sarthi</div>
+    </div>
+
+REPLACE WITH: (nothing — delete completely)
+
+
+═══════════════════════════════════════════════════════════════
+PATCH 4 — Remove the LEFT token badge (green dot / token-quota-wrap)
+         from inside <div class="topbar">
+═══════════════════════════════════════════════════════════════
+
+FIND AND DELETE this entire block from the topbar:
+
+    <!-- Token quota display -->
+    <div class="token-quota-wrap" id="token-quota-wrap" style="display:none">
+      <div class="token-quota-badge" id="token-quota-badge">
+        <div class="tq-dot" id="tq-dot"></div>
+        <span id="tq-label">-- / --</span>
+      </div>
+    </div>
+
+REPLACE WITH: (nothing — delete completely)
+
+
+═══════════════════════════════════════════════════════════════
+PATCH 5 — Replace the RIGHT token KPI with improved version
+         (label + shortened numbers + ⓘ info icon + bubble)
+═══════════════════════════════════════════════════════════════
+
+FIND (inside topbar, the token-balance-wrap block):
+    <!-- Token Balance Display -->
+    <div class="token-balance-wrap" id="token-balance-wrap" style="display:none;">
+      <div class="token-pill" id="token-pill">
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+        <span id="token-text">—</span>
+      </div>
+      <div class="token-warning" id="token-warning" style="display:none;">Low quota</div>
+    </div>
+
+REPLACE WITH:
+    <!-- Token Balance Display (improved) -->
+    <div class="token-balance-wrap" id="token-balance-wrap" style="display:none;">
+      <div class="token-info-wrap">
+        <div class="token-pill" id="token-pill">
+          <span style="font-size:10px;font-weight:600;color:inherit;opacity:0.7;letter-spacing:0.3px;text-transform:uppercase;margin-right:1px;">Tokens</span>
+          <span id="token-text">—</span>
+        </div>
+        <button class="token-info-icon" id="token-info-btn"
+          onclick="toggleTokenBubble(event)"
+          title="Token details">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10
+                     10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
+          </svg>
+        </button>
+        <div class="token-info-bubble" id="token-info-bubble">
+          <div class="tib-arrow"></div>
+          <div class="tib-row">
+            <span class="tib-label">Allocated</span>
+            <span class="tib-val" id="tib-allocated">—</span>
+          </div>
+          <div class="tib-row">
+            <span class="tib-label">Used</span>
+            <span class="tib-val" id="tib-used">—</span>
+          </div>
+          <div class="tib-row">
+            <span class="tib-label">Available</span>
+            <span class="tib-val available" id="tib-available">—</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+
+═══════════════════════════════════════════════════════════════
+PATCH 6 — Update JS: updateTokenUI() and add toggleTokenBubble()
+         Replace the existing updateTokenUI function in <script>
+═══════════════════════════════════════════════════════════════
+
+FIND:
+function updateTokenUI() {
+  const wrap = document.getElementById('token-balance-wrap');
+  const pill = document.getElementById('token-pill');
+  const txt  = document.getElementById('token-text');
+  const warn = document.getElementById('token-warning');
+
+  if (tokenState.available === null) {
+    wrap.style.display = 'none';
+    return;
+  }
+
+  wrap.style.display = 'flex';
+  pill.className = 'token-pill' + (tokenState.warn ? ' warn' : '') + (tokenState.blocked ? ' blocked' : '');
+  
+  if (tokenState.unlimited || tokenState.total === null) {
+    txt.textContent = '∞ tokens';
+    warn.style.display = 'none';
+  } else {
+    txt.textContent = `${tokenState.available.toLocaleString()} / ${tokenState.total.toLocaleString()}`;
+    warn.style.display = tokenState.warn ? 'block' : 'none';
+    warn.textContent = tokenState.warn ? 'Low quota' : (tokenState.blocked ? 'Quota exhausted' : '');
+  }
 }
+
+REPLACE WITH:
+function fmtTokens(n) {
+  if (n === null || n === undefined) return '—';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+  if (n >= 1_000)     return (n / 1_000).toFixed(1)     + 'K';
+  return n.toLocaleString();
+}
+
+function updateTokenUI() {
+  const wrap = document.getElementById('token-balance-wrap');
+  const pill = document.getElementById('token-pill');
+  const txt  = document.getElementById('token-text');
+
+  if (tokenState.available === null && !tokenState.unlimited) {
+    wrap.style.display = 'none';
+    return;
+  }
+
+  wrap.style.display = 'flex';
+
+  // Pill state class
+  pill.className = 'token-pill'
+    + (tokenState.warn    ? ' warn'    : '')
+    + (tokenState.blocked ? ' blocked' : '');
+
+  if (tokenState.unlimited || tokenState.total === null) {
+    txt.textContent = '∞';
+  } else {
+    // Short format: e.g. "806.0K / 1.00M"
+    txt.textContent = `${fmtTokens(tokenState.available)} / ${fmtTokens(tokenState.total)}`;
+  }
+
+  // Update bubble values (raw numbers for precision)
+  const tibAlloc = document.getElementById('tib-allocated');
+  const tibUsed  = document.getElementById('tib-used');
+  const tibAvail = document.getElementById('tib-available');
+
+  if (tibAlloc) tibAlloc.textContent = fmtTokens(tokenState.total);
+  if (tibUsed)  tibUsed.textContent  = fmtTokens(
+    (tokenState.total || 0) - (tokenState.available || 0)
+  );
+  if (tibAvail) {
+    tibAvail.textContent = fmtTokens(tokenState.available);
+    tibAvail.className   = 'tib-val'
+      + (tokenState.blocked ? ' blocked' : tokenState.warn ? ' warn' : ' available');
+  }
+
+  // Also sync the _applyQuotaUI blocked/warn notices
+  const blockedNotice = document.getElementById('quota-blocked-notice');
+  const warnToast     = document.getElementById('quota-warn-toast');
+  const sendBtn       = document.getElementById('send-btn');
+
+  if (tokenState.blocked) {
+    if (blockedNotice) blockedNotice.classList.add('visible');
+    if (warnToast)     warnToast.classList.remove('visible');
+    if (sendBtn && !isLoading) sendBtn.disabled = true;
+  } else {
+    if (blockedNotice) blockedNotice.classList.remove('visible');
+    if (sendBtn && !isLoading) sendBtn.disabled = false;
+    if (warnToast) {
+      if (tokenState.warn) {
+        const wt = document.getElementById('quota-warn-text');
+        if (wt) wt.textContent =
+          `Low quota: ${fmtTokens(tokenState.available)} remaining. Contact admin to recharge.`;
+        warnToast.classList.add('visible');
+      } else {
+        warnToast.classList.remove('visible');
+      }
+    }
+  }
+}
+
+// Toggle the token info bubble on ⓘ click
+function toggleTokenBubble(e) {
+  e.stopPropagation();
+  const bubble = document.getElementById('token-info-bubble');
+  if (!bubble) return;
+  bubble.classList.toggle('open');
+}
+
+// Close bubble when clicking anywhere else
+document.addEventListener('click', () => {
+  const bubble = document.getElementById('token-info-bubble');
+  if (bubble) bubble.classList.remove('open');
+});
+
+
+═══════════════════════════════════════════════════════════════
+PATCH 7 — Remove now-unused _applyQuotaUI duplicate UI logic
+         The token-quota-wrap elements are gone so _applyQuotaUI
+         no longer needs to touch them. Replace just the top part:
+═══════════════════════════════════════════════════════════════
+
+FIND (inside _applyQuotaUI):
+    const wrap  = document.getElementById('token-quota-wrap');
+    const badge = document.getElementById('token-quota-badge');
+    const dot   = document.getElementById('tq-dot');
+    const label = document.getElementById('tq-label');
+    const blockedNotice = document.getElementById('quota-blocked-notice');
+    const warnToast     = document.getElementById('quota-warn-toast');
+    const sendBtn       = document.getElementById('send-btn');
+
+    if (!wrap) return;
+
+    if (state.unlimited) {
+      wrap.style.display = 'none';
+      return;
+    }
+
+    wrap.style.display = 'flex';
+
+    const avail = state.available ?? 0;
+    const total = state.total     ?? 0;
+
+    label.textContent = `${_fmtTokens(avail)} / ${_fmtTokens(total)}`;
+
+    // Badge state
+    badge.classList.remove('tq-warn', 'tq-blocked');
+    if (state.blocked) {
+      badge.classList.add('tq-blocked');
+    } else if (state.warn) {
+      badge.classList.add('tq-warn');
+    }
+
+    // Blocked notice + send disable
+    if (state.blocked) {
+      blockedNotice.classList.add('visible');
+      warnToast.classList.remove('visible');
+      if (sendBtn) sendBtn.disabled = true;
+    } else {
+      blockedNotice.classList.remove('visible');
+      if (sendBtn && !isLoading) sendBtn.disabled = false;
+
+      if (state.warn) {
+        // Show how many tokens remain
+        const warnText = document.getElementById('quota-warn-text');
+        if (warnText) {
+          warnText.textContent =
+            `Low token quota: ${_fmtTokens(avail)} remaining. Contact admin to recharge.`;
+        }
+        warnToast.classList.add('visible');
+      } else {
+        warnToast.classList.remove('visible');
+      }
+    }
+
+REPLACE WITH:
+    // Sync state into tokenState so updateTokenUI() drives the single KPI
+    tokenState.available = state.available_tokens ?? state.available ?? null;
+    tokenState.total     = state.total_allocated  ?? state.total     ?? null;
+    tokenState.unlimited = state.unlimited || false;
+    tokenState.warn      = state.warn      || false;
+    tokenState.blocked   = state.blocked   || false;
+    updateTokenUI();   // single source of truth for all token UI
+
+
+═══════════════════════════════════════════════════════════════
+PATCH 8 — Update fetchQuotaBalance to normalize field names
+═══════════════════════════════════════════════════════════════
+
+FIND:
+  async function fetchQuotaBalance() {
+    try {
+      const r = await fetch(`${API_BASE}/tokens/balance`);
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d.status === 'success') _applyQuotaUI(d);
+    } catch (e) {
+      console.warn('Token balance fetch failed:', e);
+    }
+  }
+
+REPLACE WITH:
+  async function fetchQuotaBalance() {
+    try {
+      const r = await fetch(`${API_BASE}/tokens/balance`);
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d.status === 'success') {
+        // Normalize field names from token_manager.py response
+        _applyQuotaUI({
+          ...d,
+          available: d.available_tokens ?? d.available,
+          total:     d.total_allocated  ?? d.total,
+        });
+      }
+    } catch (e) {
+      console.warn('Token balance fetch failed:', e);
+    }
+  }
+
+
+═══════════════════════════════════════════════════════════════
+ALSO — Remove now-unused CSS classes (optional cleanup)
+       These were for the old topbar buttons. Safe to delete
+       from the <style> block if you want a cleaner file:
+       .back-btn-wrap, .back-btn, .back-btn-tooltip,
+       .logout-btn-wrap, .logout-btn, .logout-btn-tooltip,
+       .token-quota-wrap, .token-quota-badge, .tq-dot,
+       .tq-warn, .tq-blocked
+       (Leaving them does no harm — browser ignores unused CSS)
+═══════════════════════════════════════════════════════════════
+
+SUMMARY OF ALL CHANGES
+=======================
+1. Back + Logout → moved to sidebar top (above Sarthi logo)
+2. Green dot token badge (token-quota-wrap) → removed from topbar
+3. Token KPI → "Tokens 806.0K / 1.00M" with ⓘ icon
+4. ⓘ click → dark bubble showing Allocated / Used / Available
+5. Numbers → M/K format throughout (fmtTokens helper)
+6. _applyQuotaUI → delegates to updateTokenUI (single source)
+7. fetchQuotaBalance → normalizes field names
+8. All modals/confirmation popups → unchanged, same IDs, same functions
