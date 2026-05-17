@@ -1,80 +1,314 @@
-.token-pill span:first-child {
+/* =========================================
+   MOBILE / TABLET RESPONSIVE
+========================================= */
 
-  display: inline;
+@media (max-width: 900px) {
 
-  font-size: 9px;
+  #sdt-overlay {
+    padding: 0 !important;
+    align-items: flex-end !important;
+  }
 
-  opacity: 0.72;
+  #sdt-modal {
 
-  letter-spacing: 0.15px;
+    width: 100% !important;
+    height: 100dvh !important;
 
-  margin-right: 1px;
+    border-radius: 0 !important;
+  }
+
+  /* TOPBAR */
+
+  #sdt-topbar {
+
+    flex-wrap: wrap !important;
+
+    gap: 8px !important;
+
+    padding: 10px 12px 8px !important;
+  }
+
+  #sdt-title {
+
+    max-width: none !important;
+
+    flex: 1 1 auto !important;
+
+    min-width: 0 !important;
+
+    font-size: 12px !important;
+  }
+
+  #sdt-row-count {
+
+    order: 2;
+
+    font-size: 10px !important;
+  }
+
+  /* SEARCH */
+
+  #sdt-global-search {
+
+    width: 100% !important;
+
+    min-width: 0 !important;
+
+    font-size: 16px !important;
+  }
+
+  #sdt-reset-btn {
+
+    font-size: 10px !important;
+
+    padding: 5px 10px !important;
+  }
+
+  /* TABLE CONTAINER */
+
+  #sdt-table-container {
+
+    overflow: auto !important;
+
+    -webkit-overflow-scrolling: touch;
+
+    overscroll-behavior: contain;
+  }
+
+  /* TABLE */
+
+  #sdt-table {
+
+    min-width: max-content !important;
+
+    width: max-content !important;
+  }
+
+  /* CELLS */
+
+  .dt-cell {
+
+    font-size: 11px !important;
+
+    padding: 8px 10px !important;
+  }
+
+  .dt-th {
+
+    font-size: 10.5px !important;
+  }
+
+  .dt-th-inner {
+
+    padding: 7px 8px 6px !important;
+
+    gap: 3px !important;
+  }
+
+  /* STATS STRIP */
+
+  .dt-stat-card {
+
+    padding: 5px 8px 5px !important;
+  }
+
+  .dt-stat-label {
+
+    font-size: 8px !important;
+  }
+
+  .dt-stat-vals {
+
+    font-size: 8.5px !important;
+  }
+
+  /* FILTER PANEL */
+
+  #sdt-filter-panel {
+
+    width: min(280px, calc(100vw - 20px)) !important;
+
+    max-height: 70dvh !important;
+
+    overflow-y: auto !important;
+
+    border-radius: 14px !important;
+  }
+
+  /* CHIPS */
+
+  #sdt-chips {
+
+    padding: 6px 10px !important;
+  }
+
+  .sdt-chip {
+
+    font-size: 9.5px !important;
+  }
+
+  /* STATUS BAR */
+
+  #sdt-status-left {
+
+    font-size: 10px !important;
+  }
 }
+
+/* =========================================
+   VERY SMALL DEVICES
+========================================= */
+
+@media (max-width: 520px) {
+
+  #sdt-topbar {
+
+    align-items: stretch !important;
+  }
+
+  #sdt-global-search {
+
+    width: 100% !important;
+  }
+
+  #sdt-reset-btn {
+
+    flex: 1;
+  }
+
+  .dt-cell {
+
+    font-size: 10.5px !important;
+  }
+
+  .dt-type-badge {
+
+    display: none !important;
+  }
+
+  .dt-filter-btn {
+
+    width: 18px !important;
+    height: 18px !important;
+  }
+
+  .dt-sort-icon {
+
+    transform: scale(0.92);
+  }
+}
+
+
+
+-----------
+
+
+function enableTouchTableScroll() {
+
+  const cont = document.getElementById('sdt-table-container');
+
+  if (!cont) return;
+
+  let isDown = false;
+  let startX;
+  let scrollLeft;
+
+  cont.addEventListener('mousedown', (e) => {
+
+    if (window.innerWidth > 900) return;
+
+    isDown = true;
+
+    startX = e.pageX - cont.offsetLeft;
+
+    scrollLeft = cont.scrollLeft;
+  });
+
+  cont.addEventListener('mouseleave', () => {
+    isDown = false;
+  });
+
+  cont.addEventListener('mouseup', () => {
+    isDown = false;
+  });
+
+  cont.addEventListener('mousemove', (e) => {
+
+    if (!isDown) return;
+
+    e.preventDefault();
+
+    const x = e.pageX - cont.offsetLeft;
+
+    const walk = (x - startX) * 1.1;
+
+    cont.scrollLeft = scrollLeft - walk;
+  });
+}
+
+
+
+-------------
+
+
+enableTouchTableScroll();
+
+
+
+---------------
+
+
+
+#sdt-modal {
+
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+
+
+
+------------
+
+
+
+#sdt-thead {
+
+  position: sticky !important;
+
+  top: 0;
+
+  z-index: 20;
+
+  background: #fff;
+}
+
 
 
 --------------
 
+button,
+input,
+select {
 
-.token-pill {
+  touch-action: manipulation;
+}
 
-  display: flex;
-  align-items: center;
 
-  font-size: 9.5px;
+----------
 
-  padding: 3px 7px;
+#sdt-table-container {
 
-  gap: 3px;
+  background:
+    linear-gradient(to right, rgba(0,0,0,0.04), transparent 18px) left center no-repeat,
+    linear-gradient(to left, rgba(0,0,0,0.04), transparent 18px) right center no-repeat;
 
-  white-space: nowrap;
-
-  max-width: 125px;
-
-  overflow: hidden;
-
-  border-radius: 16px;
+  background-size: 18px 100%;
 }
 
 
 
---------------
 
 
-@media (max-width: 700px) {
-
-  .token-info-bubble {
-
-    right: -8px;
-
-    min-width: 165px;
-
-    max-width: calc(100vw - 24px);
-
-    padding: 9px 11px;
-
-    border-radius: 12px;
-  }
-
-  .tib-arrow {
-    right: 14px;
-  }
-}
-
-
-
-------
-
-
-@media (max-width: 700px) {
-
-  .tib-row {
-    font-size: 10px;
-  }
-
-  .tib-val {
-    font-size: 10.5px;
-  }
-}
 
 
 
