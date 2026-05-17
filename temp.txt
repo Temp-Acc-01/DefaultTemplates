@@ -1,85 +1,80 @@
+.token-pill span:first-child {
+
+  display: inline;
+
+  font-size: 9px;
+
+  opacity: 0.72;
+
+  letter-spacing: 0.15px;
+
+  margin-right: 1px;
+}
+
+
+--------------
+
+
+.token-pill {
+
+  display: flex;
+  align-items: center;
+
+  font-size: 9.5px;
+
+  padding: 3px 7px;
+
+  gap: 3px;
+
+  white-space: nowrap;
+
+  max-width: 125px;
+
+  overflow: hidden;
+
+  border-radius: 16px;
+}
+
+
+
+--------------
+
+
 @media (max-width: 700px) {
 
-  .topbar {
+  .token-info-bubble {
 
-    display: flex;
-    align-items: center;
+    right: -8px;
 
-    gap: 8px;
+    min-width: 165px;
 
-    padding: 10px 12px;
+    max-width: calc(100vw - 24px);
 
-    flex-wrap: nowrap;
+    padding: 9px 11px;
 
-    overflow: hidden;
+    border-radius: 12px;
   }
 
-  .sidebar-toggle {
-    flex-shrink: 0;
-  }
-
-  .topbar-title {
-
-    flex: 1;
-
-    min-width: 0;
-
-    font-size: 13px;
-
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  /* KPI group */
-  .topbar-badge,
-  .token-balance-wrap {
-
-    flex-shrink: 0;
-  }
-
-  .topbar-badge {
-
-    font-size: 9.5px;
-
-    padding: 3px 7px;
-
-    white-space: nowrap;
-  }
-
-  .token-pill {
-
-    font-size: 9.5px;
-
-    padding: 3px 7px;
-
-    gap: 3px;
-
-    white-space: nowrap;
-
-    max-width: 110px;
-
-    overflow: hidden;
-  }
-
-  /* hide verbose label */
-  .token-pill span:first-child {
-    display: none;
-  }
-
-  #token-text {
-    font-size: 10px;
-    font-weight: 600;
-  }
-
-  .token-info-icon {
-    width: 14px;
-    height: 14px;
-    margin-left: 1px;
-  }
-
-  .token-info-icon svg {
-    width: 12px;
-    height: 12px;
+  .tib-arrow {
+    right: 14px;
   }
 }
+
+
+
+------
+
+
+@media (max-width: 700px) {
+
+  .tib-row {
+    font-size: 10px;
+  }
+
+  .tib-val {
+    font-size: 10.5px;
+  }
+}
+
+
+
