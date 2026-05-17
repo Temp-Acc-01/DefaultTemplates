@@ -1,25 +1,26 @@
 @media (max-width: 700px) {
 
   .topbar {
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    grid-template-areas:
-      "toggle title tables"
-      "tokens tokens tokens";
 
+    display: flex;
     align-items: center;
 
-    gap: 8px 10px;
+    gap: 8px;
 
-    padding: 10px 14px;
+    padding: 10px 12px;
+
+    flex-wrap: nowrap;
+
+    overflow: hidden;
   }
 
   .sidebar-toggle {
-    grid-area: toggle;
+    flex-shrink: 0;
   }
 
   .topbar-title {
-    grid-area: title;
+
+    flex: 1;
 
     min-width: 0;
 
@@ -30,95 +31,55 @@
     text-overflow: ellipsis;
   }
 
-  .topbar-badge {
-    grid-area: tables;
+  /* KPI group */
+  .topbar-badge,
+  .token-balance-wrap {
 
-    justify-self: end;
-
-    font-size: 10px;
-
-    padding: 3px 8px;
-
-    white-space: nowrap;
+    flex-shrink: 0;
   }
 
-  .token-balance-wrap {
-    grid-area: tokens;
+  .topbar-badge {
 
-    width: 100%;
+    font-size: 9.5px;
 
-    display: flex;
-    justify-content: flex-start;
+    padding: 3px 7px;
+
+    white-space: nowrap;
   }
 
   .token-pill {
 
-    max-width: 100%;
+    font-size: 9.5px;
 
-    font-size: 10px;
+    padding: 3px 7px;
 
-    padding: 4px 9px;
-
-    gap: 4px;
-
-    overflow: hidden;
+    gap: 3px;
 
     white-space: nowrap;
+
+    max-width: 110px;
+
+    overflow: hidden;
   }
 
-  /* Reduce verbose text */
+  /* hide verbose label */
   .token-pill span:first-child {
-    font-size: 9px;
-    letter-spacing: 0.2px;
+    display: none;
   }
 
-  /* Token number */
   #token-text {
     font-size: 10px;
     font-weight: 600;
   }
 
   .token-info-icon {
-    width: 15px;
-    height: 15px;
-    margin-left: 2px;
+    width: 14px;
+    height: 14px;
+    margin-left: 1px;
   }
 
   .token-info-icon svg {
-    width: 13px;
-    height: 13px;
+    width: 12px;
+    height: 12px;
   }
 }
-
-
--------
-
-function updateResponsiveLabels() {
-
-  const tokenLabel = document.querySelector('.token-pill span');
-
-  if (!tokenLabel) return;
-
-  if (window.innerWidth <= 700) {
-    tokenLabel.textContent = 'Tokens';
-  } else {
-    tokenLabel.textContent = 'Available Tokens';
-  }
-}
-
-window.addEventListener('resize', updateResponsiveLabels);
-
-setTimeout(updateResponsiveLabels, 100);
-
-
----
-
-
-@media (max-width: 900px) {
-
-  .input-hint {
-    display: none;
-  }
-
-}
-
