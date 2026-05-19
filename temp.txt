@@ -1,62 +1,21 @@
-The problem:
-Right now every query goes through the full 4-agent pipeline regardless. So if user types:
+import google.generativeai as genai
 
-"What can you do?"
-"Which states are covered?"
-"What is maturity level?"
-"Hello"
-"How many tables do you have?"
+genai.configure(api_key="YOUR_API_KEY")
 
-All of these trigger table selection → SQL generation → validation → execution — which either fails, returns wrong results, or wastes tokens on a query that needed no SQL at all.
-Where to intercept:
-Agent 0 (TableSelectorAgent) already sees the question and all schemas. It's the right place because it has full context — schema metadata, column descriptions, sample values, table purposes. It can answer "Which states are covered?" directly from the sample values it already has without touching the DB.
-Three query categories Agent 0 should classify:
-DIRECT_ANSWER   → question answerable from schema metadata alone
-                  e.g. "what tables do you have", "what is maturity level",
-                        "hello", "what can you do"
+model = genai.GenerativeModel("gemini-2.0-flash")
 
-SQL_REQUIRED    → needs actual DB query
-                  e.g. "top 5 districts by score", "how many ULBs in Maharashtra", "which states are in the data", etc where actual querying is required to get data
-AMBIGUOUS       → clarify with user
-                  e.g. "show me everything" (too broad)
-What changes and where:
-nl_to_sql_main.py — modify TableSelectorAgent.select() to return a 4th value: query_type (DIRECT_ANSWER / SQL_REQUIRED / AMBIGUOUS). Also return direct_answer string when type is DIRECT_ANSWER. Update the output format in _TABLE_SELECTOR_SYSTEM prompt.
-nl_to_sql_main.py — modify stream_query() to check query_type after Agent 0 returns. If DIRECT_ANSWER, yield a new SSE event direct_answer with the text and immediately yield done — skip Agents 1, 2, 3, 4 entirely. Zero tokens wasted on SQL.
-sarthi_index.html — add direct_answer SSE handler that renders the answer as a clean AI bubble, no chart prompt, no download button.
-The prompt addition to Agent 0:
-The key is giving Agent 0 a clear decision boundary in its system prompt. Add a new STEP 0 before the existing STEP 1:
-Extra STEP  — CLASSIFY QUERY TYPE FIRST
+# Enable Google Search grounding
+response = model.generate_content(
+    "What is today's top news headline?",
+    tools=[{"google_search": {}}]
+)
 
-Before anything else, decide: does this question require querying the database?
-
-DIRECT_ANSWER if ANY of these are true:
-  - Greeting or conversational ("hello", "thanks", "what can you do")
-  - Question about the tool itself ("what is Sarthi", "how do I use this")  
-  - Question answerable purely from schema metadata:
-      * Table/column existence ("what tables do you have", "what columns are in Ulb")
-      * Concept definitions ("what is maturity level" → inferable from schema)
-  - Question that has no meaningful SQL translation
-
-SQL_REQUIRED if:
-  - Needs aggregation, filtering, counting, ranking from actual DB rows
-  - Needs data not visible in the schema samples
-  - Needs cross-table joins on actual data
-"what states are covered"
-
-AMBIGUOUS if:
-  - Too vague to write SQL for ("show me everything")
-  - Needs clarification before proceeding
-
-If DIRECT_ANSWER: write a concise, helpful response using schema knowledge.
-  - For greetings: introduce yourself and capabilities
-  - For schema questions: answer from the metadata you have
-  - For concept questions: explain based on column/table context
-  Be direct, professional and helpful.
-Output format change for Agent 0:
-QUERY_TYPE: DIRECT_ANSWER | SQL_REQUIRED | AMBIGUOUS
-DIRECT_ANSWER: <answer text if DIRECT_ANSWER, else NONE>
-TABLES: internal_name1,internal_name2   (NONE if DIRECT_ANSWER)
-REASONING: <...>
-ENRICHED_QUERY: <...>   (same as question if DIRECT_ANSWER)
-Token savings:
-A DIRECT_ANSWER query costs only the Agent 0 call — roughly 3,000–5,000 tokens instead of 25,000–80,000 for the full pipeline. For conversational queries this is a 10–15x token reduction.
+# Check if grounding was used
+candidate = response.candidates[0]
+if hasattr(candidate, "grounding_metadata") and candidate.grounding_metadata:
+    print("Web search (grounding) is WORKING")
+    print("Search queries used:", candidate.grounding_metadata.search_queries)
+    print("Sources:", [c.web.uri for c in candidate.grounding_metadata.grounding_chunks if c.web])
+else:
+    print("Web search did NOT trigger (or is not available)")
+    print("Response:", response.text)
