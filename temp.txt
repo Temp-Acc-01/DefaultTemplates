@@ -1,1 +1,11 @@
-now its done. now one more modification I want to add and that is about enabling internet search for the related queries to this topic we are working like the schema  metadata related. I just want to enrich the query given by user and want to return him enriched answer whether it is sql backed else direct response if question is generic or if someone is asking and it is related to what db schema metadata topic is. offcourse we will not allow internet search for any type of queries user ask rather we should guide that query to search for topics or the terminology or business or area we are covering through db metadata . so tell me how can we get this or like acheive this here at agent 0 or start 
+⌕
+Web research complete — cost to convert L2 to L3 PCSAP food procurement India government data metrics
+In the Indian food procurement context under systems like PCSAP (Procurement Centres of States and Agencies in India), L2 and L3 likely refer to levels of maturity or sophistication of data collection and management at procurement centers. Converting from L2 to L3 would then imply upgrading the technology, infrastructure, and processes at these centers to achieve a higher level of data quality, real-time reporting, and integration with other systems. The cost to convert L2 to L3 isn't explicitly defined as a standard metric but would be measured, tracked, and reported as part of the overall e
+Answer
+I understand you're asking for the cost required to convert procurement centers from Maturity Level 2 (L2) to Maturity Level 3 (L3), broken down by state. However, the available databases contain information about the number of centers at each maturity level (L0, L1, L2, L3, L4, L5) but do not track or store financial cost data associated with upgrading or converting between these maturity levels. Therefore, I cannot provide the specific cost figures you're looking for.
+The user is asking for a specific metric ("cost to convert L2 to L3") that is not present in any of the provided table schemas. The `maturitylevel_pcwisecount` and related tables only contain counts of centers at each maturity level (L0-L5), not financial cost data. The domain research context also confirms that this cost is "not explicitly defined as a standard metric" and would be "part of overall expenses," but no such expense columns exist in the schema.
+Web sources
+pib.gov.in
+scribd.com
+pcsap.in
+dfpd.gov.in
