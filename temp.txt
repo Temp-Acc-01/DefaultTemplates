@@ -1,1 +1,41 @@
-now its done. now one more modification I want to add and that is about enabling internet search for the related queries to this topic we are working like the schema  metadata related. I just want to enrich the query given by user and want to return him enriched answer whether it is sql backed else direct response if question is generic or if someone is asking and it is related to what db schema metadata topic is. offcourse we will not allow internet search for any type of queries user ask rather we should guide that query to search for topics or the terminology or business or area we are covering through db metadata . so tell me how can we get this or like acheive this here at agent 0 or start 
+first query 
+Top 5 states with highest compliance score in last year
+
+12:27:30
+U
+S
+T
+Tables selected: fci_kms_2025__maturitylevel_statecount, fci_kms_2025__states
+The user is asking for a ranked list of states based on a compliance score for "last year". The `FCI_KMS_2025` database covers the KMS 2025-26 season (September 2025 to February 2026), which is the most appropriate "last year" context for a completed season relative to the current year 2026. The `MaturityLevel_StateCount` table within this database contains counts for different maturity levels (L0-L5) aggregated by state. "Highest compliance score" is interpreted as the highest count of L5 (the highest maturity level). The `STATES` table is needed to retrieve the human-readable `StateName` by joining on `Statecode`.
+Understood as
+Retrieve the top 5 states with the highest count of L5 maturity level for the KMS 2025-26 season. Select the State Name and the count of L5 maturity level. Join the MaturityLevel_StateCount table with the States table from the FCI_KMS_2025 database using Statecode. Order the results by the count of L5 maturity level in descending order. Limit the output to the top 5 states.
+⟨⟩
+SQL generated — attempt 1
+⟨⟩
+Retrying SQL — attempt 2
+✓
+Completed in 2 attempts · 5 rows returned
+Validation failed — retrying (attempt 2)
+5 rows · 2 columns
+Download CSV
+View Table
+The top 5 states with the highest L4 counts are: West Bengal with 2316, Punjab with 2157, Odisha with 1312, Chhattisgarh with 952, and Telangana with 944.
+
+
+next query was 
+and can you return top 5 districts from these states which have highest compliance score
+
+12:28:42
+U
+S
+⟳
+Resolved entities: "can" → C, "return" → N, "have" → V, "can you" → C, "can you return" → Upload photo of waiting room where farmers can wait/rest before and during the procurement
+⌕
+Web research complete — these states PCSAP food procurement India government data metrics
+Okay, I will research the concept of "compliance score" within the context of Indian food procurement, specifically concerning the PCSAP (Procurement Centres of States and Agencies in India) system. I will focus on its meaning, measurement, reporting, and any related government policies or guidelines. Then I will use that information to respond to the user's request. Based on my research, here's a
+Clarification needed
+To provide the top 5 districts with the highest compliance score, please specify which states you are referring to. Once you provide the list of states, I can proceed with the analysis.
+The query asks for "top 5 districts from these states" but does not specify which states. This makes the query incomplete and impossible to execute. Clarification is needed from the user.
+Web Research Context
+Okay, I will research the concept of "compliance score" within the context of Indian food procurement, specifically concerning the PCSAP (Procurement Centres of States and Agencies in India) system. I will focus on its meaning, measurement, reporting, and any related government policies or guideline…
+Read full context ↓
