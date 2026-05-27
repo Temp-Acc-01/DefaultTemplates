@@ -1,17 +1,21 @@
-what to do after registration of new PC
+Q: What dimensions define access? (what restricts a user's data view)
+A: its like or or and condition will be there . particular user will have access to haryana state and this year season only likewise particular user will have access to all season but from mohali district only , particular user mainly admin have access to everything using *
 
-15:20:39
-U
-S
-Answer
-As Sarthi, a natural-language data assistant, I can help you retrieve and analyze data from the procurement center assessments. However, I cannot provide instructions or guidance on operational procedures like what steps to take after registering a new Procurement Center (PC). My function is to query the database for information, not to manage workflows or provide policy advice.
-The user is asking for a procedural instruction ("what to do after registration of new PC"), not a data query. This type of question cannot be answered by retrieving data from the database.
-20,229 tokens| 15:20:43
-can you do web search and tell me
+Q: Where should the restriction be enforced?
+A: Both — table visibility + row-level SQL filter
 
-15:21:19
-U
-S
-Answer
-As Sarthi, a natural-language data assistant, I can help you query and analyze the data available in the provided databases. I do not have the capability to perform web searches or access external information beyond the loaded schema and data.
-The user is asking if the tool can perform a web search, which is a question about the tool's functionality, not a request to query the database.
+Q: How are roles assigned currently?
+A: not defined yet - I am planning to make role and group tables
+
+
+Core Concept
+User → belongs to → Role Group → has → Permissions
+                                        ↓
+                              { tables: [...],
+                                filters: {
+                                  state: ["Haryana"],
+                                  district: "*",
+                                  season: ["2024-25"]
+                                }}
+
+
